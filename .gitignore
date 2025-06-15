@@ -1,0 +1,12 @@
+.idea
+experiments
+.cache
+*.parquet
+*.txt
+!requirements.txt
+*.gz
+*.pyc
+*.pickle
+*.csv
+*.pkl
+lightning_logs/
