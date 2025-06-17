@@ -292,6 +292,22 @@ class FeatureEngineeringLagStep(PipelineStep):
                 df[f"{col}_lag_{lag}"] =  df.groupby(['product_id', 'customer_id'])[col].shift(lag)
         self.save_artifact(pipeline, "df", df)
         
+class RollingStdFeatureStep(PipelineStep):
+    def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
+        super().__init__(name)
+        self.window = window
+        self.columns = columns
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.get_artifact("df")
+        for col in self.columns:
+            for win in self.window:
+                df[f"{col}_rolling_std_{win}"] = (
+                    df.groupby(['product_id', 'customer_id'])[col]
+                    .transform(lambda x: x.rolling(win, min_periods=1).std())
+                )
+        self.save_artifact(pipeline, "df", df)
+        
 class DiferenciaVsReferenciaStep(PipelineStep):
     """
     Crea features de diferencia entre el valor actual y una columna de referencia (lag, rolling mean, etc).
@@ -365,6 +381,40 @@ class RollingMinFeatureStep(PipelineStep):
                 df[f'{col}_rolling_min_{window}'] = grouped[col].transform(
                     lambda x: x.rolling(window, min_periods=1).min()
                 )
+        self.save_artifact(pipeline, "df", df)
+
+class RollingIsMaxFeatureStep(PipelineStep):
+    def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
+        super().__init__(name)
+        self.window = window
+        self.columns = columns
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.get_artifact("df")
+        for col in self.columns:
+            for win in self.window:
+                max_rolling = (
+                    df.groupby(['product_id', 'customer_id'])[col]
+                    .transform(lambda x: x.rolling(win, min_periods=1).max())
+                )
+                df[f"{col}_is_rolling_max_{win}"] = (df[col] == max_rolling).astype(int)
+        self.save_artifact(pipeline, "df", df)
+        
+class RollingIsMinFeatureStep(PipelineStep):
+    def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
+        super().__init__(name)
+        self.window = window
+        self.columns = columns
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.get_artifact("df")
+        for col in self.columns:
+            for win in self.window:
+                min_rolling = (
+                    df.groupby(['product_id', 'customer_id'])[col]
+                    .transform(lambda x: x.rolling(win, min_periods=1).min())
+                )
+                df[f"{col}_is_rolling_min_{win}"] = (df[col] == min_rolling).astype(int)
         self.save_artifact(pipeline, "df", df)
     
 class CreateTotalCategoryStep(PipelineStep):
