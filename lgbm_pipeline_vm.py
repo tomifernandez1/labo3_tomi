@@ -20,6 +20,10 @@ import io
 from contextlib import redirect_stdout
 from IPython.display import display, HTML
 import holidays
+from google.cloud import storage
+from urllib.parse import urlparse
+import multiprocessing
+import logging
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -74,13 +78,37 @@ class Pipeline:
     """
     Main pipeline class that manages the execution of steps and storage of artifacts.
     """
-    def __init__(self, steps: Optional[List[PipelineStep]] = None, optimize_arftifacts_memory: bool = True):
+    DEFAULT_BUCKET_NAME = "labo3_2025_tomifernandez"
+    def __init__(self, steps: Optional[List] = None, use_gcs: bool = True, bucket_name: Optional[str] = None,experiment_name: Optional[str] = None):
         """Initialize the pipeline."""
         self.steps: List[PipelineStep] = steps if steps is not None else []
         self.artifacts: Dict[str, Any] = {}
+        self.use_gcs = use_gcs
+        self.bucket_name = bucket_name or self.DEFAULT_BUCKET_NAME
+        self.storage_client = storage.Client()        
         self.last_step = None
-        self.optimize_arftifacts_memory = optimize_arftifacts_memory
+                
+        if self.use_gcs and not self.bucket_name:
+            raise ValueError("Bucket name must be provided or set as DEFAULT_BUCKET_NAME.")
+        
+        #Configuracion del logging:
+        self.experiment_name = experiment_name
 
+        #Nombre del archivo de log
+        self.log_filename = f"{self.experiment_name}_log.txt"
+
+        #Configurar logger
+        self.logger = logging.getLogger(f"PipelineLogger_{self.experiment_name}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False  # Evita duplicados si se reutiliza logger
+
+        #Si no hay handlers previos, agregamos uno
+        if not self.logger.handlers:
+            file_handler = logging.FileHandler(self.log_filename)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+        
     def add_step(self, step: PipelineStep, position: Optional[int] = None) -> None:
         """
         Add a new step to the pipeline.
@@ -96,21 +124,22 @@ class Pipeline:
 
     def save_artifact(self, artifact_name: str, artifact: Any) -> None:
         """
-        Save an artifact from a given step.
-
-        Args:
-            artifact_name (str): Name to identify the artifact.
-            artifact (Any): The artifact to save.
+        Save artifact directly to Google Cloud Storage.
         """
-        if not self.optimize_arftifacts_memory:
+        if not self.use_gcs:
             self.artifacts[artifact_name] = artifact
         else:
-            # Usa el directorio temporal del sistema operativo
-            tmp_dir = tempfile.gettempdir()
-            artifact_path = os.path.join(tmp_dir, artifact_name)
-            with open(artifact_path, 'wb') as f:
-                pickle.dump(artifact, f)
-            self.artifacts[artifact_name] = artifact_path
+            bucket = self.storage_client.bucket(self.bucket_name)
+            blob = bucket.blob(f"artifacts/{artifact_name}.pkl")
+            
+            # Serializa en memoria sin tocar el disco
+            buffer = io.BytesIO()
+            pickle.dump(artifact, buffer)
+            buffer.seek(0)
+            
+            # Subida directa al bucket
+            blob.upload_from_file(buffer, content_type='application/octet-stream')
+            self.artifacts[artifact_name] = f"gs://{self.bucket_name}/artifacts/{artifact_name}.pkl"
 
     def get_artifact(self, artifact_name: str) -> Any:
         """
@@ -122,16 +151,27 @@ class Pipeline:
         Returns:
             Any: The requested artifact.
         """
-        if not self.optimize_arftifacts_memory:
-            return self.artifacts.get(artifact_name)
-        else:
-            artifact_path = self.artifacts.get(artifact_name)
-            if artifact_path and os.path.exists(artifact_path):
-                with open(artifact_path, 'rb') as f:
-                    return pickle.load(f)
-            else:
-                warnings.warn(f"Artifact {artifact_name} not found in temp directory")
-                return None
+        artifact_path = self.artifacts.get(artifact_name)
+        if artifact_path is None or not isinstance(artifact_path, str) or not artifact_path.startswith("gs://"):
+            raise ValueError(f"Artifact '{artifact_name}' not found or not stored in GCS.")
+
+        try:
+            parsed = urlparse(artifact_path)
+            bucket_name = parsed.netloc
+            blob_path = parsed.path.lstrip('/')
+
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_path)
+
+            buffer = io.BytesIO()
+            blob.download_to_file(buffer)
+            buffer.seek(0)
+
+            return pickle.load(buffer)
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to load artifact '{artifact_name}' from GCS: {e}")
     
     def del_artifact(self, artifact_name: str, soft=True) -> None:
         """
@@ -166,24 +206,32 @@ class Pipeline:
     def run(self, verbose: bool = True, last_step_callback: Callable = None) -> None:
         """
         Execute all steps in sequence and log execution time.
-        """        
-        
-        # Run steps from the last completed step
+        Logs errors if any step fails.
+        """
         for step in self.steps:
             if verbose:
                 print(f"Executing step: {step.name}")
+            self.logger.info(f"Executing step: {step.name}")    
+
             start_time = time.time()
-            self.before_step_callback() 
-            step.execute(self)
-            self.after_step_callback()
-            end_time = time.time()
+            try:
+                self.before_step_callback()
+                step.execute(self)
+                self.after_step_callback()
+                end_time = time.time()
+            except Exception as e:
+                self.logger.error(f"Error in step '{step.name}': {e}", exc_info=True)
+                raise  #corta el script
+
             if verbose:
                 print(f"Step {step.name} completed in {end_time - start_time:.2f} seconds")
+            self.logger.info(f"Step {step.name} completed in {end_time - start_time:.2f} seconds")
             self.last_step = step
+
             if step == self.steps[-1]:
                 self.after_last_step_callback()
                 if last_step_callback:
-                    last_step_callback(self)   
+                    last_step_callback(self)
 
     def clear(self, collect_garbage: bool = False) -> None:
         """
@@ -204,9 +252,9 @@ class LoadDataFrameStep(PipelineStep):
         self.path = path
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pd.read_parquet(self.path)
+        df = pd.read_parquet(self.path, engine="pyarrow")
         df = df.drop(columns=["periodo"])
-        self.save_artifact(pipeline, "df", df)
+        pipeline.save_artifact("df", df)
 
 class SplitCustomerProductByGroupStep(PipelineStep):
     """
@@ -320,20 +368,39 @@ class DiferenciaVsReferenciaStep(PipelineStep):
         self.save_artifact(pipeline, "df", df)
 
 class RollingMeanFeatureStep(PipelineStep):
-    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None):
+    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
         super().__init__(name)
         self.window = window
         self.columns = columns
+        self.n_jobs = n_jobs
 
-    def execute(self, pipeline: "Pipeline") -> None:
+    def _compute_rolling_mean(self, args):
+        col, window, df_small = args
+        grouped = df_small.groupby(['product_id', 'customer_id'])
+        return (
+            f'{col}_rolling_mean_{window}',
+            grouped[col].transform(lambda x: x.rolling(window, min_periods=window).mean())
+        )
+
+    def execute(self, pipeline: Pipeline) -> None:
         df = pipeline.get_artifact("df")
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
-        grouped = df.groupby(['product_id', 'customer_id'])
+
+        tasks = []
         for col in self.columns:
             for window in self.window:
-                df[f'{col}_rolling_mean_{window}'] = grouped[col].transform(
-                    lambda x: x.rolling(window, min_periods=1).mean()
-                )
+                df_small = df[['product_id', 'customer_id', 'fecha', col]].copy()
+                tasks.append((col, window, df_small))
+
+        if self.n_jobs == -1:
+            self.n_jobs = multiprocessing.cpu_count()
+        with multiprocessing.Pool(processes=self.n_jobs) as pool:
+            results = pool.map(self._compute_rolling_mean, tasks)
+
+        for col_name, series in results:
+            df[col_name] = series
+
+        # Guardar el resultado como artifact
         self.save_artifact(pipeline, "df", df)
         
 class CustomerIdMeanTnAndRequestByDateStep(PipelineStep):
@@ -394,54 +461,117 @@ class ProductIdMeanTnAndRequestByCustomerStep(PipelineStep):
         self.save_artifact(pipeline, "df", df)
 
 class RollingMaxFeatureStep(PipelineStep):
-    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None):
+    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
         super().__init__(name)
         self.window = window
         self.columns = columns
+        self.n_jobs = n_jobs
 
-    def execute(self, pipeline: "Pipeline") -> None:
+    def _compute_rolling_features(self, args):
+        col, window, df_small = args
+        grouped = df_small.groupby(['product_id', 'customer_id'])
+        rolling_max = grouped[col].transform(lambda x: x.rolling(window, min_periods=window).max())
+        is_max = (df_small[col] == rolling_max).astype(int)
+        return (
+            f'{col}_rolling_max_{window}', rolling_max,
+            f'{col}_is_rolling_max_{window}', is_max
+        )
+
+    def execute(self, pipeline: Pipeline) -> None:
         df = pipeline.get_artifact("df")
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
-        grouped = df.groupby(['product_id', 'customer_id'])
+
+        tasks = []
         for col in self.columns:
             for window in self.window:
-                df[f'{col}_rolling_max_{window}'] = grouped[col].transform(
-                    lambda x: x.rolling(window, min_periods=1).max()
-                )
+                df_small = df[['product_id', 'customer_id', 'fecha', col]].copy()
+                tasks.append((col, window, df_small))
+
+        if self.n_jobs == -1:
+            self.n_jobs = multiprocessing.cpu_count()
+
+        with multiprocessing.Pool(processes=self.n_jobs) as pool:
+            results = pool.map(self._compute_rolling_features, tasks)
+
+        for max_name, max_series, ismax_name, ismax_series in results:
+            df[max_name] = max_series
+            df[ismax_name] = ismax_series
+
         self.save_artifact(pipeline, "df", df)
     
 
 class RollingMinFeatureStep(PipelineStep):
-    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None):
+    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
         super().__init__(name)
         self.window = window
         self.columns = columns
+        self.n_jobs = n_jobs
 
-    def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
-        df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
-        grouped = df.groupby(['product_id', 'customer_id'])
-        for col in self.columns:
-            for window in self.window:
-                df[f'{col}_rolling_min_{window}'] = grouped[col].transform(
-                    lambda x: x.rolling(window, min_periods=1).min()
-                )
-        self.save_artifact(pipeline, "df", df)
-        
-class RollingStdFeatureStep(PipelineStep):
-    def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
-        super().__init__(name)
-        self.window = window
-        self.columns = columns
+    def _compute_rolling_features(self, args):
+        col, window, df_small = args
+        grouped = df_small.groupby(['product_id', 'customer_id'])
+        rolling_min = grouped[col].transform(lambda x: x.rolling(window, min_periods=window).min())
+        is_min = (df_small[col] == rolling_min).astype(int)
+        return (
+            f'{col}_rolling_min_{window}', rolling_min,
+            f'{col}_is_rolling_min_{window}', is_min
+        )
 
     def execute(self, pipeline: Pipeline) -> None:
         df = pipeline.get_artifact("df")
+        df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
+
+        tasks = []
         for col in self.columns:
-            for win in self.window:
-                df[f"{col}_rolling_std_{win}"] = (
-                    df.groupby(['product_id', 'customer_id'])[col]
-                    .transform(lambda x: x.rolling(win, min_periods=1).std())
-                )
+            for window in self.window:
+                df_small = df[['product_id', 'customer_id', 'fecha', col]].copy()
+                tasks.append((col, window, df_small))
+
+        if self.n_jobs == -1:
+            self.n_jobs = multiprocessing.cpu_count()
+
+        with multiprocessing.Pool(processes=self.n_jobs) as pool:
+            results = pool.map(self._compute_rolling_features, tasks)
+
+        for min_name, min_series, ismin_name, ismin_series in results:
+            df[min_name] = min_series
+            df[ismin_name] = ismin_series
+
+        self.save_artifact(pipeline, "df", df)
+                
+class RollingStdFeatureStep(PipelineStep):
+    def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
+        super().__init__(name)
+        self.window = window
+        self.columns = columns
+        self.n_jobs = n_jobs
+
+    def _compute_rolling_std(self, args):
+        col, window, df_small = args
+        grouped = df_small.groupby(['product_id', 'customer_id'])
+        return (
+            f'{col}_rolling_std_{window}',
+            grouped[col].transform(lambda x: x.rolling(window, min_periods=window).std())
+        )
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.get_artifact("df")
+        df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
+
+        tasks = []
+        for col in self.columns:
+            for window in self.window:
+                df_small = df[['product_id', 'customer_id', 'fecha', col]].copy()
+                tasks.append((col, window, df_small))
+
+        if self.n_jobs == -1:
+            self.n_jobs = multiprocessing.cpu_count()
+        with multiprocessing.Pool(processes=self.n_jobs) as pool:
+            results = pool.map(self._compute_rolling_std, tasks)
+
+        for col_name, series in results:
+            df[col_name] = series
+
         self.save_artifact(pipeline, "df", df)
 
 class RollingIsMaxFeatureStep(PipelineStep):
@@ -990,9 +1120,9 @@ class OptunaLGBMOptimizationStep(PipelineStep):
                 'boosting_type': 'gbdt',
                 'objective': 'tweedie',
                 'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
-                'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 0.9),
-                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 0.9),
-                'bagging_freq': trial.suggest_int('bagging_freq', 1, 50),
+                'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
+                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
+                'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
                 'verbose': -1,
                 'max_bin': trial.suggest_int('max_bin', 255, 1000),
                 'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
@@ -1337,57 +1467,76 @@ class SaveSubsetExperimentStep(PipelineStep):
                 
 class SaveResults(PipelineStep):
     """
-    Guarda los resultados relevantes de cada experimento en su carpeta correspondiente.
+    Guarda los resultados relevantes de cada experimento en el bucket de GCS.
     """
     def __init__(self, exp_name: str, name: Optional[str] = None):
         super().__init__(name)
         self.exp_name = exp_name
 
+    def _upload_string(self, client, bucket_name, path, content: str):
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(path)
+        blob.upload_from_string(content)
+
+    def _upload_dataframe(self, client, bucket_name, path, df):
+        if df is not None:
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(path)
+            buffer = io.StringIO()
+            df.to_csv(buffer, index=False)
+            blob.upload_from_string(buffer.getvalue(), content_type="text/csv")
+
+    def _upload_pickle(self, client, bucket_name, path, obj):
+        if obj is not None:
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(path)
+            buffer = io.BytesIO()
+            pickle.dump(obj, buffer)
+            buffer.seek(0)
+            blob.upload_from_file(buffer, content_type="application/octet-stream")
+
     def execute(self, pipeline: Pipeline) -> None:
-        # Obtener el error de test
+        client = pipeline.storage_client
+        bucket_name = pipeline.bucket_name
+
         total_error = pipeline.get_artifact("total_error")
-        exp_dir = f"experiments/{self.exp_name}_error_test_{total_error:.4f}"
-        os.makedirs(exp_dir, exist_ok=True)        
+        exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+
         # Guardar predicciones
-        preds = pipeline.get_artifact("submission")
-        if preds is not None:
-            preds.to_csv(os.path.join(exp_dir, "submission.csv"), index=False)
+        self._upload_dataframe(client, bucket_name, exp_prefix + "submission.csv", pipeline.get_artifact("submission"))
 
         # Guardar feature importance
-        fi = pipeline.get_artifact("feature_importance_df")
-        if fi is not None:
-            fi.to_csv(os.path.join(exp_dir, "feature_importance.csv"), index=False)
+        self._upload_dataframe(client, bucket_name, exp_prefix + "feature_importance.csv", pipeline.get_artifact("feature_importance_df"))
 
         # Guardar trials de Optuna
-        trials = pipeline.get_artifact("optuna_trials_df")
-        if trials is not None:
-            trials.to_csv(os.path.join(exp_dir, "optuna_trials.csv"), index=False)
-        
-        #Error de test
-        total_error = pipeline.get_artifact("total_error")
-        with open(os.path.join(exp_dir, "total_error.txt"), "w") as f:
-            f.write(str(total_error))
+        self._upload_dataframe(client, bucket_name, exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
+
+        # Guardar total error
+        self._upload_string(client, bucket_name, exp_prefix + "total_error.txt", str(total_error))
 
         # Guardar el modelo
-        model = pipeline.get_artifact("model")
-        if model is not None:
-            with open(os.path.join(exp_dir, "model.pkl"), "wb") as f:
-                pickle.dump(model, f)
-
+        self._upload_pickle(client, bucket_name, exp_prefix + "model.pkl", pipeline.get_artifact("model"))
+        
+        #Guardar logging
+        log_local_path = pipeline.log_filename
+        log_blob_path = exp_prefix + "pipeline_log.txt"
+        if os.path.exists(log_local_path):
+            self._upload_local_file(client, bucket_name, log_blob_path, log_local_path)
+        
 #### ---- Pipeline Execution ---- ####
-
+experiment_name = f"exp_lgbm_{datetime.now().strftime('%Y%m%d_%H%M')}"
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameStep(path="df_inicial.parquet"),
+        LoadDataFrameStep(path="/home/tomifernandezlabo3/gcs-bucket/df_inicial.parquet"),
         OutlierPasoFeatureStep(fecha_outlier="2019-08-01"),
-        #ProductSizeCategoryStep(sku_size_col="sku_size"),
+        ProductSizeCategoryStep(sku_size_col="sku_size"),
         CastDataTypesStep(dtypes=
             {
                 "cat1": "category", 
                 "cat2": "category",
                 "cat3": "category",
                 "brand": "category",
-                #"product_size": "category",
+                "product_size": "category",
                 "outlier_paso": "category"
             }
         ),
@@ -1408,17 +1557,17 @@ pipeline = Pipeline(
         ChangeDataTypesStep(dtypes={
             "float64": "float32",
         }),
-        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
-        RollingMeanFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
+        #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
+        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
+        #RollingMeanFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         #RollingMaxFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         #RollingMinFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingStdFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingIsMaxFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingIsMinFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
+        #RollingStdFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_mean"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_max"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_min"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         #DiferenciaVsReferenciaStep(columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        #DiferenciaVsReferenciaStep(columns=["tn", "cust_request_qty"], ref_types=["rolling_mean"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         #ProductInteractionLagsStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         ChangeDataTypesStep(dtypes={
             "float64": "float32",
@@ -1437,7 +1586,7 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=2),
+        OptunaLGBMOptimizationStep(n_trials=25),
         TrainFinalModelLGBTestingStep(),
         PredictStep(predict_set="X_test"),
         EvaluatePredictionsSteps(y_actual_df="y_test"),
@@ -1445,8 +1594,31 @@ pipeline = Pipeline(
         SaveFeatureImportanceStep(),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
         KaggleSubmissionStep(),
-        SaveResults(exp_name=f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}")
+        SaveResults(exp_name=experiment_name)
     ],
-    optimize_arftifacts_memory=True
+    experiment_name=experiment_name,
 )
-pipeline.run(verbose=True)
+
+try:
+    pipeline.run(verbose=True)
+
+except Exception as e:
+    pipeline.logger.error("Pipeline failed with an exception:", exc_info=True)
+
+finally:
+    
+    try:
+        client = pipeline.storage_client
+        bucket_name = pipeline.bucket_name
+        local_log_path = pipeline.log_filename
+        log_blob_path = f"experiments/{experiment_name}/pipeline_log.txt"
+
+        if os.path.exists(local_log_path):
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(log_blob_path)
+            blob.upload_from_filename(local_log_path)
+            print(f"Log file uploaded to GCS: {log_blob_path}")
+
+    except Exception as log_upload_error:
+        print("Error uploading log to GCS:", log_upload_error)
+        traceback.print_exc()
