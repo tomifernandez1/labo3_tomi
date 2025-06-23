@@ -1248,20 +1248,40 @@ class PredictStep(PipelineStep):
 
     def execute(self, pipeline: Pipeline) -> None:
         X_predict = pipeline.get_artifact(self.predict_set)
-        scaler = pipeline.get_artifact("scaler")
-        if scaler:
-            X_predict[scaler.feature_names_in_] = scaler.transform(X_predict[scaler.feature_names_in_])
-        model = pipeline.get_artifact("model_testing")  # or "model" for final model
+
+        # Intentar obtener el scaler
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without feature scaling.")
+
+        # Si hay scaler y tiene feature_names_in_, aplicar transformación
+        if scaler and hasattr(scaler, "feature_names_in_"):
+            cols_to_scale = scaler.feature_names_in_
+            X_predict[cols_to_scale] = scaler.transform(X_predict[cols_to_scale])
+
+        # Obtener el modelo
+        model = pipeline.get_artifact("model_testing")  # o "model" para modelo final
         predictions = model.predict(X_predict)
-        # los valores de predictions que dan menores a 0 los seteo en 0
-        scaler_target = pipeline.get_artifact("scaler_target")
+
+        # Intentar obtener el scaler_target
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without target inverse scaling.")
+
+        # Inversión de escala del target si corresponde
         if scaler_target:
             predictions = scaler_target.inverse_transform(predictions.reshape(-1, 1)).flatten()
-        # la columna de predictions seria "predictions" y le agrego columna de product_id
+
+        # Formatear predicciones
         predictions = pd.DataFrame(predictions, columns=["predictions"], index=X_predict.index)
         predictions["product_id"] = X_predict["product_id"]
-        self.save_artifact(pipeline, "predictions", predictions)
 
+        # Guardar predicciones
+        self.save_artifact(pipeline, "predictions", predictions)
 
 class EvaluatePredictionsSteps(PipelineStep):
     def __init__(self, y_actual_df: str, name: Optional[str] = None):
