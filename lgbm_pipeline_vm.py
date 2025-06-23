@@ -24,6 +24,7 @@ from google.cloud import storage
 from urllib.parse import urlparse
 import multiprocessing
 import logging
+import shutil
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -79,13 +80,13 @@ class Pipeline:
     Main pipeline class that manages the execution of steps and storage of artifacts.
     """
     DEFAULT_BUCKET_NAME = "labo3_2025_tomifernandez"
-    def __init__(self, steps: Optional[List] = None, use_gcs: bool = True, bucket_name: Optional[str] = None,experiment_name: Optional[str] = None):
+    def __init__(self, steps: Optional[List] = None, use_gcs: bool = False, bucket_name: Optional[str] = None,experiment_name: Optional[str] = None):
         """Initialize the pipeline."""
         self.steps: List[PipelineStep] = steps if steps is not None else []
         self.artifacts: Dict[str, Any] = {}
         self.use_gcs = use_gcs
         self.bucket_name = bucket_name or self.DEFAULT_BUCKET_NAME
-        self.storage_client = storage.Client()        
+        self.storage_client = storage.Client() if self.use_gcs else None      
         self.last_step = None
                 
         if self.use_gcs and not self.bucket_name:
@@ -124,26 +125,35 @@ class Pipeline:
 
     def save_artifact(self, artifact_name: str, artifact: Any) -> None:
         """
-        Save artifact directly to Google Cloud Storage.
+        Save artifact to Google Cloud Storage if use_gcs is True,
+        otherwise save it locally to ./home/tomifernandezlabo3/gcs-bucket.
         """
-        if not self.use_gcs:
-            self.artifacts[artifact_name] = artifact
-        else:
+        if self.use_gcs:
             bucket = self.storage_client.bucket(self.bucket_name)
             blob = bucket.blob(f"artifacts/{artifact_name}.pkl")
-            
+
             # Serializa en memoria sin tocar el disco
             buffer = io.BytesIO()
             pickle.dump(artifact, buffer)
             buffer.seek(0)
-            
+
             # Subida directa al bucket
             blob.upload_from_file(buffer, content_type='application/octet-stream')
             self.artifacts[artifact_name] = f"gs://{self.bucket_name}/artifacts/{artifact_name}.pkl"
+        else:
+            # Guardado local en /tmp
+            local_dir = "/tmp"
+            os.makedirs(local_dir, exist_ok=True)
+
+            artifact_path = os.path.join(local_dir, f"{artifact_name}.pkl")
+            with open(artifact_path, "wb") as f:
+                pickle.dump(artifact, f)
+
+            self.artifacts[artifact_name] = artifact_path
 
     def get_artifact(self, artifact_name: str) -> Any:
         """
-        Retrieve a stored artifact.
+        Retrieve a stored artifact from GCS or local storage.
 
         Args:
             artifact_name (str): Name of the artifact to retrieve.
@@ -152,26 +162,39 @@ class Pipeline:
             Any: The requested artifact.
         """
         artifact_path = self.artifacts.get(artifact_name)
-        if artifact_path is None or not isinstance(artifact_path, str) or not artifact_path.startswith("gs://"):
-            raise ValueError(f"Artifact '{artifact_name}' not found or not stored in GCS.")
+        if artifact_path is None:
+            raise ValueError(f"Artifact '{artifact_name}' not found.")
 
-        try:
-            parsed = urlparse(artifact_path)
-            bucket_name = parsed.netloc
-            blob_path = parsed.path.lstrip('/')
+        # Caso GCS
+        if isinstance(artifact_path, str) and artifact_path.startswith("gs://"):
+            try:
+                parsed = urlparse(artifact_path)
+                bucket_name = parsed.netloc
+                blob_path = parsed.path.lstrip('/')
 
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(blob_path)
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                blob = bucket.blob(blob_path)
 
-            buffer = io.BytesIO()
-            blob.download_to_file(buffer)
-            buffer.seek(0)
+                buffer = io.BytesIO()
+                blob.download_to_file(buffer)
+                buffer.seek(0)
 
-            return pickle.load(buffer)
+                return pickle.load(buffer)
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to load artifact '{artifact_name}' from GCS: {e}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to load artifact '{artifact_name}' from GCS: {e}")
+
+        # Caso local
+        else:
+            artifact_path_local = os.path.join("/tmp", f"{artifact_name}.pkl")
+            if not os.path.exists(artifact_path_local):
+                raise FileNotFoundError(f"Local artifact file not found at {artifact_path_local}")
+            try:
+                with open(artifact_path_local, "rb") as f:
+                    return pickle.load(f)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load local artifact '{artifact_name}': {e}")
     
     def del_artifact(self, artifact_name: str, soft=True) -> None:
         """
@@ -242,6 +265,35 @@ class Pipeline:
             gc.collect()
         self.artifacts = {}
         self.last_step = None
+        
+class ReduceMemoryUsageStep(PipelineStep):
+    def __init__(self, input_key: str = "df", name: Optional[str] = None):
+        super().__init__(name)
+        self.input_key = input_key
+            
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.get_artifact(self.input_key)
+        initial_mem_usage = df.memory_usage().sum() / 1024**2
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                c_min = df[col].min()
+                c_max = df[col].max()
+                if pd.api.types.is_float_dtype(df[col]):
+                    if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        df[col] = df[col].astype(np.float32)
+                elif pd.api.types.is_integer_dtype(df[col]):
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        df[col] = df[col].astype(np.int8)
+                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        df[col] = df[col].astype(np.int16)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        df[col] = df[col].astype(np.int32)
+        
+        final_mem_usage = df.memory_usage().sum() / 1024**2
+        print('--- Memory usage before: {:.2f} MB'.format(initial_mem_usage))
+        print('--- Memory usage after: {:.2f} MB'.format(final_mem_usage))
+        print('--- Decreased memory usage by {:.1f}%\n'.format(100 * (initial_mem_usage - final_mem_usage) / initial_mem_usage))
+        self.save_artifact(pipeline, "df", df) 
 
 class LoadDataFrameStep(PipelineStep):
     """
@@ -1097,15 +1149,30 @@ class OptunaLGBMOptimizationStep(PipelineStep):
 
     def execute(self, pipeline: Pipeline) -> None:
         
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without scaling.")
+
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without target scaling.")
+                
         X_train = pipeline.get_artifact("X_train")
         y_train = pipeline.get_artifact("y_train")
         X_eval = pipeline.get_artifact("X_eval")
         y_eval = pipeline.get_artifact("y_eval")
         df_eval = pipeline.get_artifact("eval_data")
-        scaler = pipeline.get_artifact("scaler")
-        scaler_target = pipeline.get_artifact("scaler_target")
-        
-        custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
+     
+        if scaler_target is not None:
+            custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
+        else:
+            pipeline.logger.warning("CustomMetric created without scaler_target.")
+            custom_metric = CustomMetric(df_eval, product_id_col='product_id')        
+            
         cat_features = [col for col in X_train.columns if X_train[col].dtype.name == 'category']
 
         def objective(trial):
@@ -1467,64 +1534,55 @@ class SaveSubsetExperimentStep(PipelineStep):
                 
 class SaveResults(PipelineStep):
     """
-    Guarda los resultados relevantes de cada experimento en el bucket de GCS.
+    Guarda los resultados relevantes de cada experimento directamente en la carpeta local
+    donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
     """
+    # Ruta fija donde está montado el bucket de GCS
+    BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
+
     def __init__(self, exp_name: str, name: Optional[str] = None):
         super().__init__(name)
         self.exp_name = exp_name
 
-    def _upload_string(self, client, bucket_name, path, content: str):
-        bucket = client.bucket(bucket_name)
-        blob = bucket.blob(path)
-        blob.upload_from_string(content)
+    def _save_string_local(self, relative_path, content: str):
+        full_path = os.path.join(self.BASE_BUCKET_PATH, relative_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(content)
 
-    def _upload_dataframe(self, client, bucket_name, path, df):
+    def _save_dataframe_local(self, relative_path, df):
         if df is not None:
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(path)
-            buffer = io.StringIO()
-            df.to_csv(buffer, index=False)
-            blob.upload_from_string(buffer.getvalue(), content_type="text/csv")
+            full_path = os.path.join(self.BASE_BUCKET_PATH, relative_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            df.to_csv(full_path, index=False)
 
-    def _upload_pickle(self, client, bucket_name, path, obj):
+    def _save_pickle_local(self, relative_path, obj):
         if obj is not None:
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(path)
-            buffer = io.BytesIO()
-            pickle.dump(obj, buffer)
-            buffer.seek(0)
-            blob.upload_from_file(buffer, content_type="application/octet-stream")
+            full_path = os.path.join(self.BASE_BUCKET_PATH, relative_path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "wb") as f:
+                pickle.dump(obj, f)
 
     def execute(self, pipeline: Pipeline) -> None:
-        client = pipeline.storage_client
-        bucket_name = pipeline.bucket_name
-
         total_error = pipeline.get_artifact("total_error")
         exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
 
-        # Guardar predicciones
-        self._upload_dataframe(client, bucket_name, exp_prefix + "submission.csv", pipeline.get_artifact("submission"))
+        self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.get_artifact("submission"))
+        self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.get_artifact("feature_importance_df"))
+        self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
+        self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
+        self._save_pickle_local(exp_prefix + "model.pkl", pipeline.get_artifact("model"))
 
-        # Guardar feature importance
-        self._upload_dataframe(client, bucket_name, exp_prefix + "feature_importance.csv", pipeline.get_artifact("feature_importance_df"))
-
-        # Guardar trials de Optuna
-        self._upload_dataframe(client, bucket_name, exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
-
-        # Guardar total error
-        self._upload_string(client, bucket_name, exp_prefix + "total_error.txt", str(total_error))
-
-        # Guardar el modelo
-        self._upload_pickle(client, bucket_name, exp_prefix + "model.pkl", pipeline.get_artifact("model"))
-        
-        #Guardar logging
         log_local_path = pipeline.log_filename
-        log_blob_path = exp_prefix + "pipeline_log.txt"
         if os.path.exists(log_local_path):
-            self._upload_local_file(client, bucket_name, log_blob_path, log_local_path)
-        
+            log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+            os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
+            import shutil
+            shutil.copy2(log_local_path, log_dest_path)
+            
+                    
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.now().strftime('%Y%m%d_%H%M')}"
+experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
 pipeline = Pipeline(
     steps=[
         LoadDataFrameStep(path="/home/tomifernandezlabo3/gcs-bucket/df_inicial.parquet"),
@@ -1557,21 +1615,19 @@ pipeline = Pipeline(
         ChangeDataTypesStep(dtypes={
             "float64": "float32",
         }),
-        #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
-        #RollingMeanFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        #RollingMaxFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        #RollingMinFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        #RollingStdFeatureStep(window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_mean"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_max"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        #DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_min"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        FeatureEngineeringLagStep(lags=[1,2,3], columns=["tn"]),
+        #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
+        RollingMeanFeatureStep(window=[2,3], columns=["tn"]),
+        RollingMaxFeatureStep(window=[2,3], columns=["tn"]),
+        RollingMinFeatureStep(window=[2,3], columns=["tn"]),
+        RollingStdFeatureStep(window=[2,3], columns=["tn"]),
+        DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["lag"], window=[2,3]),
+        DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_mean"], window=[2,3]),
+        DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_max"], window=[2,3]),
+        DiferenciaVsReferenciaStep(columns=["tn"], ref_types=["rolling_min"], window=[2,3]),
         #DiferenciaVsReferenciaStep(columns=["tn", "cust_request_qty","tn_cat1_vendidas", "tn_cat2_vendidas", "tn_cat3_vendidas", "tn_brand_vendidas","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         #ProductInteractionLagsStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        ChangeDataTypesStep(dtypes={
-            "float64": "float32",
-        }),
+        ReduceMemoryUsageStep(),
         DateRelatedFeaturesStep(),
         CastDataTypesStep(dtypes=
             {
@@ -1586,7 +1642,7 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=25),
+        OptunaLGBMOptimizationStep(n_trials=3),
         TrainFinalModelLGBTestingStep(),
         PredictStep(predict_set="X_test"),
         EvaluatePredictionsSteps(y_actual_df="y_test"),
@@ -1606,19 +1662,19 @@ except Exception as e:
     pipeline.logger.error("Pipeline failed with an exception:", exc_info=True)
 
 finally:
-    
     try:
-        client = pipeline.storage_client
-        bucket_name = pipeline.bucket_name
         local_log_path = pipeline.log_filename
-        log_blob_path = f"experiments/{experiment_name}/pipeline_log.txt"
+        # Ruta dentro del bucket montado localmente
+        bucket_mounted_path = "/home/tomifernandezlabo3/gcs-bucket"
+        log_dest_dir = os.path.join(bucket_mounted_path, "experiments", experiment_name)
+        os.makedirs(log_dest_dir, exist_ok=True)
+
+        log_dest_path = os.path.join(log_dest_dir, "pipeline_log.txt")
 
         if os.path.exists(local_log_path):
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(log_blob_path)
-            blob.upload_from_filename(local_log_path)
-            print(f"Log file uploaded to GCS: {log_blob_path}")
+            shutil.copy2(local_log_path, log_dest_path)
+            print(f"Log file copied to mounted bucket path: {log_dest_path}")
 
     except Exception as log_upload_error:
-        print("Error uploading log to GCS:", log_upload_error)
+        print("Error copying log to mounted bucket path:", log_upload_error)
         traceback.print_exc()
