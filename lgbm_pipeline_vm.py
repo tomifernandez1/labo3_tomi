@@ -1297,28 +1297,40 @@ class PlotFeatureImportanceStep(PipelineStep):
         
 class TrainFinalModelLGBTestingStep(PipelineStep):
     """
-    Entrena el modelo final LightGBM usando el dataset hasta Septiembre para Testear sobre Octubre
+    Entrena el modelo final LightGBM usando el dataset hasta Septiembre para testear sobre Octubre
     con los mejores hiperparámetros encontrados por Optuna.
     """
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        # Cargar datos y transformadores
+        # Cargar datos
         X_train_final = pipeline.get_artifact("X_train_intermedio")
         y_train_final = pipeline.get_artifact("y_train_intermedio")
-        scaler = pipeline.get_artifact("scaler")
-        scaler_target = pipeline.get_artifact("scaler_target")
+
+        # Intentar obtener scaler
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without scaling.")
+
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without target scaling.")
 
         # Escalar si corresponde
         if scaler:
             X_train_final[scaler.feature_names_in_] = scaler.transform(X_train_final[scaler.feature_names_in_])
+        if scaler_target:
             y_train_final = pd.Series(
                 scaler_target.transform(y_train_final.values.reshape(-1, 1)).flatten(),
                 index=y_train_final.index,
             )
 
-        # Cargar hiperparámetros óptimos y num_boost_rounds
+        # Cargar hiperparámetros óptimos
         best_params = pipeline.get_artifact("best_lgbm_params")
         best_num_boost_rounds = pipeline.get_artifact("best_num_boost_rounds")
 
@@ -1328,14 +1340,13 @@ class TrainFinalModelLGBTestingStep(PipelineStep):
         # Dataset final
         train_data = lgb.Dataset(X_train_final, label=y_train_final, categorical_feature=cat_features)
 
-        # Entrenamiento del modelo final (sin early stopping)
+        # Entrenar modelo final
         model = lgb.train(
             best_params,
             train_data,
             num_boost_round=best_num_boost_rounds
         )
-
-        # Guardar modelo entrenado
+        # Guardar modelo
         self.save_artifact(pipeline, "model_testing", model)
         
 class TrainFinalModelLGBKaggleStep(PipelineStep):
@@ -1347,21 +1358,33 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        # Cargar datos y transformadores
+        # Cargar datos
         X_train_final = pipeline.get_artifact("X_train_final")
         y_train_final = pipeline.get_artifact("y_train_final")
-        scaler = pipeline.get_artifact("scaler")
-        scaler_target = pipeline.get_artifact("scaler_target")
+
+        # Intentar obtener scaler
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without scaling.")
+
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without target scaling.")
 
         # Escalar si corresponde
         if scaler:
             X_train_final[scaler.feature_names_in_] = scaler.transform(X_train_final[scaler.feature_names_in_])
+        if scaler_target:
             y_train_final = pd.Series(
                 scaler_target.transform(y_train_final.values.reshape(-1, 1)).flatten(),
                 index=y_train_final.index,
             )
 
-        # Cargar hiperparámetros óptimos y num_boost_rounds
+        # Cargar hiperparámetros óptimos
         best_params = pipeline.get_artifact("best_lgbm_params")
         best_num_boost_rounds = pipeline.get_artifact("best_num_boost_rounds")
 
@@ -1371,7 +1394,7 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         # Dataset final
         train_data = lgb.Dataset(X_train_final, label=y_train_final, categorical_feature=cat_features)
 
-        # Entrenamiento del modelo final (sin early stopping)
+        # Entrenamiento del modelo final
         model = lgb.train(
             best_params,
             train_data,
@@ -1380,7 +1403,6 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
 
         # Guardar modelo entrenado
         self.save_artifact(pipeline, "model", model)
-
         
 class SaveFeatureImportanceStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
@@ -1418,17 +1440,40 @@ class KaggleSubmissionStep(PipelineStep):
         model = pipeline.get_artifact("model")
         kaggle_pred = pipeline.get_artifact("kaggle_pred")
         X_kaggle = pipeline.get_artifact("X_kaggle")
-        scaler = pipeline.get_artifact("scaler")
+
+        # Intentar obtener scaler
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without scaling X_kaggle.")
+
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without inverse transform.")
+
+        # Escalar si corresponde
         if scaler:
             X_kaggle[scaler.feature_names_in_] = scaler.transform(X_kaggle[scaler.feature_names_in_])
+        else:
+            pipeline.logger.info("Skipping input scaling for X_kaggle.")
+
+        # Predicción
         preds = model.predict(X_kaggle)
-        scaler_target = pipeline.get_artifact("scaler_target")
+
+        # Desescalar si corresponde
         if scaler_target:
             preds = scaler_target.inverse_transform(preds.reshape(-1, 1)).flatten()
-        #kaggle_pred["tn_predicha"] = model.predict(X_kaggle) # try using .loc[row_indexer, col_indexer] = value instead
+        else:
+            pipeline.logger.info("Skipping inverse transform for predictions.")
+
+        # Guardar predicciones
         kaggle_pred["tn_predicha"] = preds.copy()
         submission = kaggle_pred.groupby("product_id")["tn_predicha"].sum().reset_index()
         submission.columns = ["product_id", "tn"]
+
         self.save_artifact(pipeline, "submission", submission)
         
 class KaggleSubmissionStepSubset(PipelineStep):
