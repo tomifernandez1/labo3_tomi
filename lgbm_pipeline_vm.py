@@ -1439,7 +1439,7 @@ class SaveFeatureImportanceStep(PipelineStep):
         self.save_artifact(pipeline, "feature_importance_df", df_importance)        
         
 class FilterProductsIDStep(PipelineStep):
-    def __init__(self, product_file = "product_id_apredecir201912.txt", dfs=["df"], name: Optional[str] = None):
+    def __init__(self, product_file = "/home/tomifernandezlabo3/labo3_tomi/product_id_apredecir201912.txt", dfs=["df"], name: Optional[str] = None):
         super().__init__(name)
         self.file = product_file
         self.dfs = dfs
