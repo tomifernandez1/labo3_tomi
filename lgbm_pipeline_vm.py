@@ -1050,7 +1050,7 @@ class PrepareXYStep(PipelineStep):
         y_eval = eval_data[target]
 
         X_test = test[features]
-        y_test = test[target]
+        y_test = test[['product_id', 'target']]
 
         X_train_final = df_final[features]
         y_train_final = df_final[target]
@@ -1190,6 +1190,7 @@ class OptunaLGBMOptimizationStep(PipelineStep):
                 'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
                 'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
                 'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
+                'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
                 'verbose': -1,
                 'max_bin': trial.suggest_int('max_bin', 255, 1000),
                 'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
