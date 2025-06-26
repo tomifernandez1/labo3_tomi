@@ -3,10 +3,9 @@ import random
 import logging
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from sklearn.preprocessing import RobustScaler
-from dtaidistance import dtw_parallel
-from typing import List, Tuple
+from dtaidistance import dtw
+import time
 
 
 class DTWSeriesProcessor:
@@ -15,7 +14,8 @@ class DTWSeriesProcessor:
                  use_sample: bool = False,
                  sample_size: int = 3000,
                  seed: int = 42,
-                 log_file: str = None):
+                 log_file: str = None,
+                 output_dir: str = None):
         """
         Parameters:
         - parquet_path: Ruta al archivo .parquet
@@ -35,6 +35,7 @@ class DTWSeriesProcessor:
         self.sample_series = []
         self.sample_keys = []
         self.distance_matrix_sample = None
+        self.output_dir = output_dir or "."
 
         self._setup_logging(log_file)
 
@@ -96,31 +97,57 @@ class DTWSeriesProcessor:
 
     def compute_dtw_distance_matrix(self):
         logging.info("Calculando matriz de distancias DTW paralelizada...")
-        self.distance_matrix_sample = dtw_parallel.distance_matrix_parallel(
+        self.distance_matrix_sample = dtw.distance_matrix_fast(
             self.sample_series,
             compact=False,
             parallel=True,
-            use_c=True,
-            num_workers=os.cpu_count()
+            use_c=True
         )
         logging.info(f"Matriz de distancias DTW calculada: shape = {self.distance_matrix_sample.shape}")
 
-    def export_distance_matrix(self, output_path: str = "distance_matrix_sample.csv"):
+    def export_distance_matrix(self, filename: str = "distance_matrix_sample.csv"):
+        os.makedirs(self.output_dir, exist_ok=True)  # Crear carpeta si no existe
+        output_path = os.path.join(self.output_dir, filename)
         logging.info(f"Exportando matriz de distancias a CSV: {output_path}")
         df_out = pd.DataFrame(self.distance_matrix_sample,
-                              index=self.sample_keys,
-                              columns=self.sample_keys)
+                            index=self.sample_keys,
+                            columns=self.sample_keys)
         df_out.to_csv(output_path)
         logging.info("Exportación completada.")
 
     def run_full_pipeline(self):
         logging.info("Iniciando pipeline completo DTW...")
+
+        start = time.time()
         self.load_and_prepare_data()
+        elapsed = time.time() - start
+        logging.info(f"load_and_prepare_data tardó {elapsed:.2f} segundos")
+
+        start = time.time()
         self.pivot_to_wide_format()
+        elapsed = time.time() - start
+        logging.info(f"pivot_to_wide_format tardó {elapsed:.2f} segundos")
+
+        start = time.time()
         self.preprocess_series()
+        elapsed = time.time() - start
+        logging.info(f"preprocess_series tardó {elapsed:.2f} segundos")
+
+        start = time.time()
         self.select_series()
+        elapsed = time.time() - start
+        logging.info(f"select_series tardó {elapsed:.2f} segundos")
+
+        start = time.time()
         self.compute_dtw_distance_matrix()
+        elapsed = time.time() - start
+        logging.info(f"compute_dtw_distance_matrix tardó {elapsed:.2f} segundos")
+
+        start = time.time()
         self.export_distance_matrix()
+        elapsed = time.time() - start
+        logging.info(f"export_distance_matrix tardó {elapsed:.2f} segundos")
+
         logging.info("Pipeline DTW finalizado correctamente.")
 
 
@@ -130,7 +157,6 @@ if __name__ == "__main__":
     # Para ejecutar sobre una muestra:
     # processor = DTWSeriesProcessor("df_inicial.parquet", use_sample=True, sample_size=1000)
 
-    # Para ejecutar sobre TODO el dataset:
-    processor = DTWSeriesProcessor("df_inicial.parquet", use_sample=False)
-
+    # Para ejecutar sobre todo el dataset:
+    processor = DTWSeriesProcessor(parquet_path="/home/tomifernandezlabo3/gcs-bucket/df_inicial.parquet",use_sample=True,sample_size=3000,seed=42, log_file="dtw_pipeline.log",output_dir="/home/tomifernandezlabo3/gcs-bucket")
     processor.run_full_pipeline()
