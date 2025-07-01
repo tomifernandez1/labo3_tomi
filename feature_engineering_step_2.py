@@ -84,6 +84,7 @@ class Pipeline:
         """Initialize the pipeline."""
         self.steps: List[PipelineStep] = steps if steps is not None else []
         self.artifacts: Dict[str, Any] = {}
+        self.df: Optional[pd.DataFrame] = None
         self.use_gcs = use_gcs
         self.bucket_name = bucket_name or self.DEFAULT_BUCKET_NAME
         self.storage_client = storage.Client() if self.use_gcs else None      
@@ -267,12 +268,11 @@ class Pipeline:
         self.last_step = None
         
 class ReduceMemoryUsageStep(PipelineStep):
-    def __init__(self, input_key: str = "df", name: Optional[str] = None):
+    def __init__(self, name: Optional[str] = None):
         super().__init__(name)
-        self.input_key = input_key
-            
+        
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact(self.input_key)
+        df = pipeline.df
         initial_mem_usage = df.memory_usage().sum() / 1024**2
         for col in df.columns:
             if pd.api.types.is_numeric_dtype(df[col]):
@@ -293,7 +293,7 @@ class ReduceMemoryUsageStep(PipelineStep):
         print('--- Memory usage before: {:.2f} MB'.format(initial_mem_usage))
         print('--- Memory usage after: {:.2f} MB'.format(final_mem_usage))
         print('--- Decreased memory usage by {:.1f}%\n'.format(100 * (initial_mem_usage - final_mem_usage) / initial_mem_usage))
-        self.save_artifact(pipeline, "df", df) 
+        pipeline.df = df 
 
 class LoadDataFrameStep(PipelineStep):
     """
@@ -306,7 +306,23 @@ class LoadDataFrameStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
         df = pd.read_parquet(self.path, engine="pyarrow")
         df = df.drop(columns=["periodo"])
-        pipeline.save_artifact("df", df)
+        pipeline.df = df
+        
+class LoadDataFrameFromPickleStep(PipelineStep):
+    """
+    Carga un DataFrame desde un archivo .pkl y lo guarda en pipeline.df.
+    """
+    def __init__(self, path: str, name: Optional[str] = None):
+        super().__init__(name)
+        self.path = path
+
+    def execute(self, pipeline: Pipeline) -> None:
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(f"No se encontró el archivo: {self.path}")
+        
+        df = pd.read_pickle(self.path)
+        pipeline.df = df
+        print(f"DataFrame cargado desde: {self.path} (shape: {df.shape})")
 
 class SplitCustomerProductByGroupStep(PipelineStep):
     """
@@ -315,17 +331,78 @@ class SplitCustomerProductByGroupStep(PipelineStep):
     def __init__(self, n_splits=3, name: Optional[str] = None):
         super().__init__(name)
         self.n_splits = n_splits
-
+        
+    
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         combos = df[["product_id", "customer_id"]].drop_duplicates().reset_index(drop=True)
         combos = combos.sample(frac=1, random_state=42).reset_index(drop=True)  # <-- SHUFFLE
         combos["subset"] = combos.index % self.n_splits
+        df_subsets = {}
         for i in range(self.n_splits):
             combos_i = combos[combos["subset"] == i][["product_id", "customer_id"]]
             merged = df.merge(combos_i, on=["product_id", "customer_id"], how="inner")
             merged = merged.sort_values(["product_id", "customer_id", "fecha"])
-            self.save_artifact(pipeline, f"df_subset_{i+1}", merged)
+            df_subsets[f"subset_{i+1}"] = merged
+        pipeline.df_subsets = df_subsets
+        print(f"Dividido en {self.n_splits} subsets y guardado en pipeline.df_subsets.")
+        
+class SubsetStep(PipelineStep):
+    """
+    Filtra el DataFrame manteniendo:
+    - Las combinaciones (customer_id, product_id) que explican top_fraction del total de tn.
+    - Una muestra aleatoria (sample_fraction_rest) del resto.
+    """
+
+    def __init__(
+        self,
+        tn_col: str = "tn",
+        top_fraction: float = 0.9,
+        sample_fraction_rest: float = 0.30,
+        random_state: int = 42,
+        name: Optional[str] = None
+    ):
+        super().__init__(name)
+        self.tn_col = tn_col
+        self.top_fraction = top_fraction
+        self.sample_fraction_rest = sample_fraction_rest
+        self.random_state = random_state
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        # Paso 1: Agregado por serie
+        tn_per_series = (
+            df.groupby(["customer_id", "product_id"])[self.tn_col]
+            .sum()
+            .reset_index()
+            .sort_values(by=self.tn_col, ascending=False)
+        )
+
+        # Paso 2: Porcentaje acumulado
+        tn_per_series["cum_tn"] = tn_per_series[self.tn_col].cumsum()
+        total_tn = tn_per_series[self.tn_col].sum()
+        tn_per_series["cum_tn_pct"] = tn_per_series["cum_tn"] / total_tn
+
+        # Paso 3: Top % completo
+        top_df = tn_per_series[tn_per_series["cum_tn_pct"] <= self.top_fraction]
+
+        # Paso 4: Muestreo del resto
+        rest_df = tn_per_series[tn_per_series["cum_tn_pct"] > self.top_fraction]
+        sampled_rest_df = rest_df.sample(
+            frac=self.sample_fraction_rest, random_state=self.random_state
+        )
+
+        # Paso 5: Combinar y filtrar original
+        selected_combos = pd.concat([top_df, sampled_rest_df], ignore_index=True)
+        df_filtered = df.merge(
+            selected_combos[["customer_id", "product_id"]],
+            on=["customer_id", "product_id"],
+            how="inner"
+        )
+
+        # Guardar en pipeline
+        pipeline.df = df_filtered
 
 class CastDataTypesStep(PipelineStep):
     def __init__(self, dtypes: Dict[str, str], name: Optional[str] = None):
@@ -333,11 +410,11 @@ class CastDataTypesStep(PipelineStep):
         self.dtypes = dtypes
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for col, dtype in self.dtypes.items():
             df[col] = df[col].astype(dtype)
         df.info()
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 
 class ChangeDataTypesStep(PipelineStep):
@@ -346,12 +423,12 @@ class ChangeDataTypesStep(PipelineStep):
         self.dtypes = dtypes
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for original_dtype, dtype in self.dtypes.items():
             for col in df.select_dtypes(include=[original_dtype]).columns:
                 df[col] = df[col].astype(dtype)
         df.info()
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 
 class FilterFirstDateStep(PipelineStep):
@@ -360,10 +437,10 @@ class FilterFirstDateStep(PipelineStep):
         self.first_date = first_date
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df[df["fecha"] >= self.first_date]
         print(f"Filtered DataFrame shape: {df.shape}")
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class ShareTNFeaturesStep(PipelineStep):
     """
@@ -374,7 +451,7 @@ class ShareTNFeaturesStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         # Share respecto al total del producto en la fecha
         df["share_tn_product"] = df[self.tn_col] / df.groupby(["fecha", "product_id"])[self.tn_col].transform("sum")
         # Share respecto al total del customer en la fecha
@@ -382,7 +459,7 @@ class ShareTNFeaturesStep(PipelineStep):
         for cat in ["cat1", "cat2", "cat3", "brand"]:
             col_name = f"share_tn_{cat}"
             df[col_name] = df[self.tn_col] / df.groupby(["fecha", cat])[self.tn_col].transform("sum")        
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class FeatureEngineeringLagStep(PipelineStep):
     def __init__(self, lags: List[int], columns: List, name: Optional[str] = None):
@@ -391,11 +468,11 @@ class FeatureEngineeringLagStep(PipelineStep):
         self.columns = columns
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for col in self.columns:
             for lag in self.lags:
                 df[f"{col}_lag_{lag}"] =  df.groupby(['product_id', 'customer_id'])[col].shift(lag)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class DiferenciaVsReferenciaStep(PipelineStep):
     """
@@ -409,7 +486,7 @@ class DiferenciaVsReferenciaStep(PipelineStep):
         self.window = window      # Ej: [1, 3, 6, 12]
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for col in self.columns:
             for ref_type in self.ref_types:
                 for window in self.window:
@@ -417,7 +494,33 @@ class DiferenciaVsReferenciaStep(PipelineStep):
                     diff_col = f"{col}_diff_{ref_type}_{window}"
                     if ref_col in df.columns:
                         df[diff_col] = df[col] - df[ref_col]
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
+        
+class DiferenciaRelativaVsReferenciaStep(PipelineStep):
+    """
+    Crea features de diferencia relativa entre el valor actual y una columna de referencia (lag, rolling mean, etc).
+    Ejemplo: tn_reldiff_rolling_mean_3 = (tn / tn_rolling_mean_3) - 1
+    """
+    def __init__(self, columns: list, ref_types: list, window: list, name: Optional[str] = None):
+        super().__init__(name)
+        self.columns = columns
+        self.ref_types = ref_types  # Ej: ["lag", "rolling_mean"]
+        self.window = window        # Ej: [1, 3, 6, 12]
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+        for col in self.columns:
+            for ref_type in self.ref_types:
+                for window in self.window:
+                    ref_col = f"{col}_{ref_type}_{window}"
+                    reldiff_col = f"{col}_reldiff_{ref_type}_{window}"
+                    if ref_col in df.columns:
+                        df[reldiff_col] = np.where(
+                            df[ref_col] != 0,
+                            df[col] / df[ref_col] - 1,
+                            np.nan
+                        )
+        pipeline.df = df
 
 class RollingMeanFeatureStep(PipelineStep):
     def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
@@ -435,7 +538,7 @@ class RollingMeanFeatureStep(PipelineStep):
         )
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
 
         tasks = []
@@ -453,7 +556,7 @@ class RollingMeanFeatureStep(PipelineStep):
             df[col_name] = series
 
         # Guardar el resultado como artifact
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class CustomerIdMeanTnAndRequestByDateStep(PipelineStep):
     """
@@ -463,7 +566,7 @@ class CustomerIdMeanTnAndRequestByDateStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         # Promedio de tn por customer y fecha
         mean_tn = (
             df.groupby(["customer_id", "fecha"])["tn"]
@@ -481,7 +584,7 @@ class CustomerIdMeanTnAndRequestByDateStep(PipelineStep):
         # Merge al dataframe original
         df = df.merge(mean_tn, on=["customer_id", "fecha"], how="left")
         df = df.merge(mean_cust_req, on=["customer_id", "fecha"], how="left")
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class ProductIdMeanTnAndRequestByCustomerStep(PipelineStep):
     """
@@ -492,7 +595,7 @@ class ProductIdMeanTnAndRequestByCustomerStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         # Promedio de tn por product_id (entre sus customers)
         mean_tn = (
             df.groupby("product_id")["tn"]
@@ -510,7 +613,7 @@ class ProductIdMeanTnAndRequestByCustomerStep(PipelineStep):
         # Merge al dataframe original
         df = df.merge(mean_tn, on="product_id", how="left")
         df = df.merge(mean_cust_req, on="product_id", how="left")
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class RollingMaxFeatureStep(PipelineStep):
     def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
@@ -530,7 +633,7 @@ class RollingMaxFeatureStep(PipelineStep):
         )
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
 
         tasks = []
@@ -549,7 +652,7 @@ class RollingMaxFeatureStep(PipelineStep):
             df[max_name] = max_series
             df[ismax_name] = ismax_series
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
     
 
 class RollingMinFeatureStep(PipelineStep):
@@ -570,7 +673,7 @@ class RollingMinFeatureStep(PipelineStep):
         )
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
 
         tasks = []
@@ -589,7 +692,7 @@ class RollingMinFeatureStep(PipelineStep):
             df[min_name] = min_series
             df[ismin_name] = ismin_series
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
                 
 class RollingStdFeatureStep(PipelineStep):
     def __init__(self, window: List[int], columns: List[str], name: Optional[str] = None, n_jobs=-1):
@@ -607,7 +710,7 @@ class RollingStdFeatureStep(PipelineStep):
         )
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(by=['product_id', 'customer_id', 'fecha'])
 
         tasks = []
@@ -624,7 +727,7 @@ class RollingStdFeatureStep(PipelineStep):
         for col_name, series in results:
             df[col_name] = series
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class RollingIsMaxFeatureStep(PipelineStep):
     def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
@@ -633,7 +736,7 @@ class RollingIsMaxFeatureStep(PipelineStep):
         self.columns = columns
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for col in self.columns:
             for win in self.window:
                 max_rolling = (
@@ -641,7 +744,7 @@ class RollingIsMaxFeatureStep(PipelineStep):
                     .transform(lambda x: x.rolling(win, min_periods=1).max())
                 )
                 df[f"{col}_is_rolling_max_{win}"] = (df[col] == max_rolling).astype(int)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class RollingIsMinFeatureStep(PipelineStep):
     def __init__(self, window: List[int], columns: List, name: Optional[str] = None):
@@ -650,7 +753,7 @@ class RollingIsMinFeatureStep(PipelineStep):
         self.columns = columns
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         for col in self.columns:
             for win in self.window:
                 min_rolling = (
@@ -658,7 +761,7 @@ class RollingIsMinFeatureStep(PipelineStep):
                     .transform(lambda x: x.rolling(win, min_periods=1).min())
                 )
                 df[f"{col}_is_rolling_min_{win}"] = (df[col] == min_rolling).astype(int)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
     
 class CreateTotalCategoryStep(PipelineStep):
     def __init__(self, name: Optional[str] = None, cat: str = "cat1", tn: str = "tn"):
@@ -667,13 +770,13 @@ class CreateTotalCategoryStep(PipelineStep):
         self.tn = tn
     
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(['fecha', self.cat])
         df[f"{self.tn}_{self.cat}_vendidas"] = (
             df.groupby(['fecha', self.cat])[self.tn]
               .transform('sum')
         )
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class FeatureEngineeringProductInteractionStep(PipelineStep):
 
@@ -683,7 +786,7 @@ class FeatureEngineeringProductInteractionStep(PipelineStep):
         Quiero obtener los x productos con mas tn del ultimo mes y crear x nuevas columnas que es la suma de tn de esos productos.
         se deben agregan entonces respetando la temporalidad la columna product_{product_id}_total_tn
         """
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         last_date = df["fecha"].max()
         last_month_df = df[df["fecha"] == last_date]
         top_products = last_month_df.groupby("product_id").aggregate({"tn": "sum"}).nlargest(10, "tn").index.tolist()
@@ -694,7 +797,7 @@ class FeatureEngineeringProductInteractionStep(PipelineStep):
             product_df = product_df.rename(columns={"tn": f"product_{product_id}_total_tn"})
             product_df = product_df[["fecha", f"product_{product_id}_total_tn"]]
             df = df.merge(product_df, on="fecha", how="left")
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class FeatureEngineeringTop20ProductsStep(PipelineStep):
     def __init__(self, tn_col: str = "tn", top_n: int = 20, name: Optional[str] = None):
@@ -703,7 +806,7 @@ class FeatureEngineeringTop20ProductsStep(PipelineStep):
         self.top_n = top_n
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
 
         # 1) Obtener última fecha
         last_date = df["fecha"].max()
@@ -729,7 +832,7 @@ class FeatureEngineeringTop20ProductsStep(PipelineStep):
             )
             df = df.merge(product_agg, on="fecha", how="left")
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class ProductInteractionLagsStep(PipelineStep):
     """
@@ -740,13 +843,13 @@ class ProductInteractionLagsStep(PipelineStep):
         self.lags = lags
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         product_total_cols = [col for col in df.columns if col.startswith("product_") and col.endswith("_total_tn")]
         df = df.sort_values(by=['fecha'])
         for col in product_total_cols:
             for lag in self.lags:
                 df[f"{col}_lag_{lag}"] = df[col].shift(lag)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class ProductInteractionRollingMeanStep(PipelineStep):
     """
@@ -757,13 +860,13 @@ class ProductInteractionRollingMeanStep(PipelineStep):
         self.windows = windows
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         product_total_cols = [col for col in df.columns if col.startswith("product_") and col.endswith("_total_tn")]
         df = df.sort_values(by=['fecha'])
         for col in product_total_cols:
             for window in self.windows:
                 df[f"{col}_rolling_mean_{window}"] = df[col].rolling(window, min_periods=1).mean()
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class ProductInteractionRollingMinMaxStep(PipelineStep):
     """
@@ -774,14 +877,14 @@ class ProductInteractionRollingMinMaxStep(PipelineStep):
         self.windows = windows
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         product_total_cols = [col for col in df.columns if col.startswith("product_") and col.endswith("_total_tn")]
         df = df.sort_values(by=['fecha'])
         for col in product_total_cols:
             for window in self.windows:
                 df[f"{col}_rolling_max_{window}"] = df[col].rolling(window, min_periods=1).max()
                 df[f"{col}_rolling_min_{window}"] = df[col].rolling(window, min_periods=1).min()
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 
 class FeatureEngineeringProductCatInteractionStep(PipelineStep):
@@ -795,11 +898,11 @@ class FeatureEngineeringProductCatInteractionStep(PipelineStep):
         # agrupo el dataframe por cat1 (sumando), obteniendo fecha, cat1 y
         # luego paso el dataframe a wide format, donde cada columna es una categoria  y la fila es la suma de tn para cada cat1
         # luego mergeo al dataframe original por fecha y product_id
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df_cat = df.groupby(["fecha", self.cat]).agg({"tn": "sum"}).reset_index()
         df_cat = df_cat.pivot(index="fecha", columns=self.cat, values="tn").reset_index()
         df = df.merge(df_cat, on="fecha", how="left")
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class OutlierPasoFeatureStep(PipelineStep):
     def __init__(self, fecha_outlier: str = "2019-08-01", name: Optional[str] = None):
@@ -807,9 +910,9 @@ class OutlierPasoFeatureStep(PipelineStep):
         self.fecha_outlier = pd.to_datetime(fecha_outlier)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df["outlier_paso"] = (df["fecha"] == self.fecha_outlier).astype(np.uint8)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class PeriodsSinceLastPurchaseStep(PipelineStep):
     def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
@@ -817,7 +920,7 @@ class PeriodsSinceLastPurchaseStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(['customer_id', 'product_id', 'fecha'])
         
         def periods_since_last_purchase(series):
@@ -837,7 +940,7 @@ class PeriodsSinceLastPurchaseStep(PipelineStep):
             df.groupby(['customer_id', 'product_id'])[self.tn_col]
               .transform(periods_since_last_purchase)
         )
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class CantidadUltimaCompraStep(PipelineStep):
     """
@@ -848,7 +951,7 @@ class CantidadUltimaCompraStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(['product_id', 'customer_id', 'fecha'])
         def get_last_purchase(series):
             last = np.nan
@@ -862,7 +965,7 @@ class CantidadUltimaCompraStep(PipelineStep):
             df.groupby(['product_id', 'customer_id'])['tn']
             .transform(get_last_purchase)
         )
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class DiferenciaTNUltimaCompraStep(PipelineStep):
     """
@@ -872,11 +975,11 @@ class DiferenciaTNUltimaCompraStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         if "cantidad_ultima_compra" not in df.columns:
             raise ValueError("La columna 'cantidad_ultima_compra' no existe. Ejecuta CantidadUltimaCompraStep antes.")
         df["diferencia_tn_ultima_compra"] = df["tn"] - df["cantidad_ultima_compra"]
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class PeriodsSinceLastPurchaseCustomerLevelStep(PipelineStep):
     """
@@ -888,7 +991,7 @@ class PeriodsSinceLastPurchaseCustomerLevelStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df = df.sort_values(['customer_id', 'fecha'])
 
         def periods_since_last_purchase(series):
@@ -908,7 +1011,7 @@ class PeriodsSinceLastPurchaseCustomerLevelStep(PipelineStep):
             df.groupby(['customer_id'])[self.tn_col]
               .transform(periods_since_last_purchase)
         )
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class ProductIdBuyersCountByDateStep(PipelineStep):
     """
@@ -919,7 +1022,7 @@ class ProductIdBuyersCountByDateStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         # Contar compradores únicos por producto y fecha (tn > 0)
         buyers_count = (
             df[df["tn"] > 0]
@@ -932,7 +1035,7 @@ class ProductIdBuyersCountByDateStep(PipelineStep):
         df = df.merge(buyers_count, on=["product_id", "fecha"], how="left")
         # Si algún producto no tuvo compradores esa fecha, poner 0
         df["product_id_unique_customers"] = df["product_id_unique_customers"].fillna(0).astype(int)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class CustomerIdUniqueProductsByDateStep(PipelineStep):
     """
@@ -943,7 +1046,7 @@ class CustomerIdUniqueProductsByDateStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         # Contar productos únicos por customer y fecha (tn > 0)
         products_count = (
             df[df["tn"] > 0]
@@ -956,7 +1059,7 @@ class CustomerIdUniqueProductsByDateStep(PipelineStep):
         df = df.merge(products_count, on=["customer_id", "fecha"], how="left")
         # Si algún customer no compró productos esa fecha, poner 0
         df["customer_id_unique_products_purchased"] = df["customer_id_unique_products_purchased"].fillna(0).astype(int)
-        self.save_artifact(pipeline, "df", df)      
+        pipeline.df = df      
         
 class ProductSizeCategoryStep(PipelineStep):
     def __init__(self, sku_size_col: str = "sku_size", name: Optional[str] = None):
@@ -964,7 +1067,7 @@ class ProductSizeCategoryStep(PipelineStep):
         self.sku_size_col = sku_size_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         def categorize(size):
             if size < 200:
                 return "small"
@@ -973,14 +1076,14 @@ class ProductSizeCategoryStep(PipelineStep):
             else:
                 return "large"
         df["product_size"] = df[self.sku_size_col].apply(categorize)
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class DateRelatedFeaturesStep(PipelineStep):
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         df["year"] = df["fecha"].dt.year
         df["quarter"] = df["fecha"].dt.quarter
         df["mes"] = df["fecha"].dt.month
@@ -1006,7 +1109,7 @@ class DateRelatedFeaturesStep(PipelineStep):
         # Merge con el df original
         df = df.merge(feriados_mes, on=['year', 'mes'], how='left')
         df['feriados_en_mes'] = df['feriados_en_mes'].fillna(0).astype(int)     
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class EdadProductoStep(PipelineStep):
     def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
@@ -1014,7 +1117,7 @@ class EdadProductoStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         
         # Ordenar por producto y fecha
         df = df.sort_values(["product_id", "fecha"])
@@ -1036,7 +1139,7 @@ class EdadProductoStep(PipelineStep):
               .transform(compute_edad)
         )
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
         
 class EdadClienteStep(PipelineStep):
     def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
@@ -1044,7 +1147,7 @@ class EdadClienteStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
 
         # Ordenar por cliente y fecha para mantener la secuencia temporal
         df = df.sort_values(["customer_id", "fecha"])
@@ -1064,7 +1167,7 @@ class EdadClienteStep(PipelineStep):
               .transform(compute_edad)
         )
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
 
 class EdadCustomerProductoStep(PipelineStep):
     def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
@@ -1072,7 +1175,7 @@ class EdadCustomerProductoStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
 
         # Ordenar para mantener la secuencia temporal dentro de cada combinación
         df = df.sort_values(["customer_id", "product_id", "fecha"])
@@ -1092,14 +1195,62 @@ class EdadCustomerProductoStep(PipelineStep):
               .transform(compute_edad)
         )
 
-        self.save_artifact(pipeline, "df", df)
+        pipeline.df = df
+        
+import multiprocessing
+
+class CountZeroPeriodsInWindowStep(PipelineStep):
+    """
+    Cuenta cuántos períodos en una ventana deslizante tienen tn == 0, por grupo (customer_id, product_id),
+    paralelizado por combinación columna × ventana.
+    """
+    def __init__(self, tn_columns: List[str], windows: List[int], name: Optional[str] = None, n_jobs: int = -1):
+        super().__init__(name)
+        self.tn_columns = tn_columns
+        self.windows = windows
+        self.n_jobs = n_jobs
+
+    def _count_zeros(self, values):
+        return (values == 0).sum()
+
+    def _compute_zero_count(self, args):
+        col, window, df_small = args
+        grouped = df_small.groupby(['product_id', 'customer_id'])
+        return (
+            f"{col}_zeros_last_{window}",
+            grouped[col].transform(lambda x: x.rolling(window, min_periods=1).apply(self._count_zeros, raw=True))
+        )
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+        df = df.sort_values(by=["product_id", "customer_id", "fecha"])
+
+        # Preparar tareas: combinaciones de columnas × ventanas
+        tasks = []
+        for col in self.tn_columns:
+            for window in self.windows:
+                df_small = df[["product_id", "customer_id", "fecha", col]].copy()
+                tasks.append((col, window, df_small))
+
+        # Paralelizar
+        if self.n_jobs == -1:
+            self.n_jobs = multiprocessing.cpu_count()
+
+        with multiprocessing.Pool(processes=self.n_jobs) as pool:
+            results = pool.map(self._compute_zero_count, tasks)
+
+        # Agregar resultados al df
+        for col_name, series in results:
+            df[col_name] = series
+
+        pipeline.df = df
         
 class SplitDataFrameStep(PipelineStep):
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.get_artifact("df")
+        df = pipeline.df
         sorted_dated = sorted(df["fecha"].unique())
         last_date = sorted_dated[-1] # es 12-2019
         last_test_date = sorted_dated[-3] # needs a gap because forecast moth+2
@@ -1758,7 +1909,8 @@ class SaveResults(PipelineStep):
         self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
         self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
         self._save_pickle_local(exp_prefix + "model.pkl", pipeline.get_artifact("model"))
-
+        self._save_pickle_local(exp_prefix + "df_subset.pkl", pipeline.df)
+        
         log_local_path = pipeline.log_filename
         if os.path.exists(log_local_path):
             log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
@@ -1768,11 +1920,11 @@ class SaveResults(PipelineStep):
             
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" # Nombre del experimento que inicia todo. 
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameStep(path="/home/tomifernandezlabo3/gcs-bucket/df_inicial.parquet"),
-        SplitCustomerProductByGroupStep(n_splits=5),
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_final.pkl"), ## Cambiar por el path correcto del pickle
+        SubsetStep(),
         DateRelatedFeaturesStep(),
         CastDataTypesStep(dtypes=
             {
@@ -1783,6 +1935,7 @@ pipeline = Pipeline(
                 "year": "uint16",
                 "periodo": "uint16",
             }),
+        CountZeroPeriodsInWindowStep(tn_columns=["tn"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
         FeatureEngineeringLagStep(lags=[1,2,3], columns=["tn"]),
         #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
         RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
@@ -1793,6 +1946,11 @@ pipeline = Pipeline(
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        SaveResults(exp_name=experiment_name, save_dataframes=True),
         ReduceMemoryUsageStep()
     ],
     experiment_name=experiment_name,
