@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 import multiprocessing
 import logging
 import shutil
+import traceback
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -347,62 +348,47 @@ class SplitCustomerProductByGroupStep(PipelineStep):
         pipeline.df_subsets = df_subsets
         print(f"Dividido en {self.n_splits} subsets y guardado en pipeline.df_subsets.")
         
-class SubsetStep(PipelineStep):
+class WeightedSubsampleSeriesStep(PipelineStep):
     """
-    Filtra el DataFrame manteniendo:
-    - Las combinaciones (customer_id, product_id) que explican top_fraction del total de tn.
-    - Una muestra aleatoria (sample_fraction_rest) del resto.
-    """
-
+    Submuestrea series (customer_id, product_id) ponderando por el promedio de tn.
+    Se priorizan combinaciones con mayor promedio en la selección aleatoria."""
+    
     def __init__(
         self,
         tn_col: str = "tn",
-        top_fraction: float = 0.9,
-        sample_fraction_rest: float = 0.30,
+        sample_fraction: float = 0.25,
         random_state: int = 42,
         name: Optional[str] = None
     ):
         super().__init__(name)
         self.tn_col = tn_col
-        self.top_fraction = top_fraction
-        self.sample_fraction_rest = sample_fraction_rest
+        self.sample_fraction = sample_fraction
         self.random_state = random_state
 
-    def execute(self, pipeline: Pipeline) -> None:
+    def execute(self, pipeline: "Pipeline") -> None:
         df = pipeline.df
-
-        # Paso 1: Agregado por serie
-        tn_per_series = (
+        # 1. Calcular promedio de tn por serie
+        series_avg_tn = (
             df.groupby(["customer_id", "product_id"])[self.tn_col]
-            .sum()
-            .reset_index()
-            .sort_values(by=self.tn_col, ascending=False)
+            .mean()
+            .reset_index(name="avg_tn")
         )
-
-        # Paso 2: Porcentaje acumulado
-        tn_per_series["cum_tn"] = tn_per_series[self.tn_col].cumsum()
-        total_tn = tn_per_series[self.tn_col].sum()
-        tn_per_series["cum_tn_pct"] = tn_per_series["cum_tn"] / total_tn
-
-        # Paso 3: Top % completo
-        top_df = tn_per_series[tn_per_series["cum_tn_pct"] <= self.top_fraction]
-
-        # Paso 4: Muestreo del resto
-        rest_df = tn_per_series[tn_per_series["cum_tn_pct"] > self.top_fraction]
-        sampled_rest_df = rest_df.sample(
-            frac=self.sample_fraction_rest, random_state=self.random_state
+        # 2. Normalizar pesos
+        series_avg_tn["sampling_prob"] = series_avg_tn["avg_tn"] / series_avg_tn["avg_tn"].sum()
+        # 3. Muestrear series con probabilidad proporcional al promedio
+        sampled_series = series_avg_tn.sample(
+            frac=self.sample_fraction,
+            weights="sampling_prob",
+            random_state=self.random_state
         )
-
-        # Paso 5: Combinar y filtrar original
-        selected_combos = pd.concat([top_df, sampled_rest_df], ignore_index=True)
+        # 4. Filtrar dataset original
         df_filtered = df.merge(
-            selected_combos[["customer_id", "product_id"]],
+            sampled_series[["customer_id", "product_id"]],
             on=["customer_id", "product_id"],
-            how="inner"
-        )
-
-        # Guardar en pipeline
+            how="inner")
+        
         pipeline.df = df_filtered
+
 
 class CastDataTypesStep(PipelineStep):
     def __init__(self, dtypes: Dict[str, str], name: Optional[str] = None):
@@ -1926,7 +1912,7 @@ class SaveResults(PipelineStep):
 
         # Guardar DataFrame final
         if hasattr(pipeline, "df") and pipeline.df is not None:
-            self._save_pickle_local(exp_prefix + "df_procesamiento_2.pkl", pipeline.df)
+            self._save_pickle_local(exp_prefix + "df_sampled_fe.pkl", pipeline.df)
 
         # Guardar log si existe
         if hasattr(pipeline, "log_filename"):
@@ -1941,7 +1927,7 @@ experiment_name = "exp_lgbm_20250701_2307" # Nombre del experimento que inicia t
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Cambiar por el path correcto del pickle
-        SubsetStep(),
+        WeightedSubsampleSeriesStep(sample_fraction=0.30),
         DateRelatedFeaturesStep(),
         CastDataTypesStep(dtypes=
             {

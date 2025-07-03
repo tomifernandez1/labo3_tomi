@@ -25,6 +25,8 @@ from urllib.parse import urlparse
 import multiprocessing
 import logging
 import shutil
+import traceback
+from optuna.exceptions import TrialPruned
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -1309,9 +1311,11 @@ class TrainModelLGBStep(PipelineStep):
         pipeline.model = model
         
 class OptunaLGBMOptimizationStep(PipelineStep):
-    def __init__(self, n_trials=50, name: Optional[str] = None):
+    def __init__(self, n_trials=50,study_name="optuna_lgbm", db_path="optuna_study.db", name: Optional[str] = None):
         super().__init__(name)
         self.n_trials = n_trials
+        self.study_name = study_name
+        self.db_path = db_path  # Ruta local al .db        
 
     def execute(self, pipeline: Pipeline) -> None:
         
@@ -1342,52 +1346,65 @@ class OptunaLGBMOptimizationStep(PipelineStep):
         cat_features = [col for col in X_train.columns if X_train[col].dtype.name == 'category']
 
         def objective(trial):
-            train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features)
-            eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
-            callbacks = [lgb.early_stopping(200)]
-            param = {
-                'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'random_state': 42,
-                'boosting_type': 'gbdt',
-                'objective': 'tweedie',
-                'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
-                'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
-                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
-                'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
-                'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
-                'verbose': -1,
-                'max_bin': trial.suggest_int('max_bin', 255, 1000),
-                'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
-                'lambda_l2': trial.suggest_float('lambda_l2', 1e-4, 10.0, log=True),
-                'n_jobs': -1,
-            }
-            num_boost_rounds = trial.suggest_int('num_boost_rounds', 500, 2000)
+            try:
+                train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features)
+                eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
+                callbacks = [lgb.early_stopping(200)]
+                param = {
+                    'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
+                    'max_depth': trial.suggest_int('max_depth', 3, 10),
+                    'random_state': 42,
+                    'boosting_type': 'gbdt',
+                    'objective': 'tweedie',
+                    'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
+                    'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
+                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
+                    'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
+                    'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
+                    'verbose': -1,
+                    'max_bin': trial.suggest_int('max_bin', 255, 1000),
+                    'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
+                    'lambda_l2': trial.suggest_float('lambda_l2', 1e-4, 10.0, log=True),
+                    'n_jobs': -1,
+                }
+                num_boost_rounds = trial.suggest_int('num_boost_rounds', 500, 2000)
 
-            model = lgb.train(
-                param,
-                train_data,
-                num_boost_round=num_boost_rounds,
-                valid_sets=[eval_data],
-                feval=custom_metric,
-                callbacks=callbacks
-            )            
-            preds = model.predict(X_eval)
-            _, score, _ = custom_metric(preds, lgb.Dataset(X_eval, label=y_eval))
+                model = lgb.train(
+                    param,
+                    train_data,
+                    num_boost_round=num_boost_rounds,
+                    valid_sets=[eval_data],
+                    feval=custom_metric,
+                    callbacks=callbacks
+                )            
+                preds = model.predict(X_eval)
+                _, score, _ = custom_metric(preds, lgb.Dataset(X_eval, label=y_eval))
 
-            trial.set_user_attr("score", score)  # Save score in trial object
-            trial.set_user_attr("num_boost_rounds", num_boost_rounds)
-            del model
-            gc.collect()
-            return score
+                trial.set_user_attr("score", score)  # Save score in trial object
+                trial.set_user_attr("num_boost_rounds", num_boost_rounds)
+                del model
+                gc.collect()
+                return score
+            except Exception as e:
+                pipeline.logger.warning(f"Trial {trial.number} failed: {e}")
+                raise TrialPruned()  # Ignora el trial pero continua la ejecucion.
         
-        study = optuna.create_study(direction='minimize')
+        # Crear/recuperar el estudio con almacenamiento persistente
+        storage_url = f"sqlite:///{self.db_path}"
+        study = optuna.create_study(
+            direction='minimize',
+            study_name=self.study_name,
+            storage=storage_url,
+            load_if_exists=True
+        )        
+        
+        pipeline.logger.info(f"Starting optimization with {self.n_trials} trials.")
         study.optimize(objective, n_trials=self.n_trials)
+        pipeline.logger.info("Optimization completed.")
         best_trial = study.best_trial
         best_params = best_trial.params.copy()
         best_num_boost_rounds = best_trial.user_attrs.get("num_boost_rounds", 1000)
-
         pipeline.best_params = best_params
         pipeline.best_num_boost_rounds = best_num_boost_rounds
 
@@ -1400,12 +1417,10 @@ class OptunaLGBMOptimizationStep(PipelineStep):
                 'trial': trial.number,
                 'score': trial.user_attrs.get("score", None),
                 'num_boost_rounds': trial.user_attrs.get("num_boost_rounds", None),
-                **trial.params
-            }
+                **trial.params}
             trial_rows.append(row)
-
+            
         df_trials = pd.DataFrame(trial_rows).sort_values(by="score")
-        pipeline.optuna_trials_df = df_trials
         pipeline.optuna_trials_df = df_trials
         
 class PredictStep(PipelineStep):
@@ -1900,10 +1915,10 @@ class SaveResults(PipelineStep):
             shutil.copy2(log_local_path, log_dest_path)            
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_subset.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_sampled_fe.pkl"), ## Cambiar por el path correcto del pickle
         SplitDataFrameStep(),
         PrepareXYStep(),
         OptunaLGBMOptimizationStep(n_trials=300),
@@ -1918,3 +1933,27 @@ pipeline = Pipeline(
     ],
     experiment_name=experiment_name,
     )
+
+try:
+    pipeline.run(verbose=True)
+
+except Exception as e:
+    pipeline.logger.error("Pipeline failed with an exception:", exc_info=True)
+
+finally:
+    try:
+        local_log_path = pipeline.log_filename
+        # Ruta dentro del bucket montado localmente
+        bucket_mounted_path = "/home/tomifernandezlabo3/gcs-bucket"
+        log_dest_dir = os.path.join(bucket_mounted_path, "experiments", experiment_name)
+        os.makedirs(log_dest_dir, exist_ok=True)
+
+        log_dest_path = os.path.join(log_dest_dir, "pipeline_log.txt")
+
+        if os.path.exists(local_log_path):
+            shutil.copy2(local_log_path, log_dest_path)
+            print(f"Log file copied to mounted bucket path: {log_dest_path}")
+
+    except Exception as log_upload_error:
+        print("Error copying log to mounted bucket path:", log_upload_error)
+        traceback.print_exc()
