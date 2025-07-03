@@ -1874,7 +1874,6 @@ class SaveResults(PipelineStep):
     Guarda los resultados relevantes de cada experimento directamente en la carpeta local
     donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
     """
-    # Ruta fija donde está montado el bucket de GCS
     BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
 
     def __init__(self, exp_name: str, name: Optional[str] = None):
@@ -1900,48 +1899,62 @@ class SaveResults(PipelineStep):
             with open(full_path, "wb") as f:
                 pickle.dump(obj, f)
 
-    def execute(self, pipeline: Pipeline) -> None:
-        total_error = pipeline.get_artifact("total_error")
-        exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+    def execute(self, pipeline) -> None:
+        total_error = getattr(pipeline, "total_error", None)
+        if total_error is not None:
+            exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+        else:
+            exp_prefix = f"experiments/{self.exp_name}/"
 
-        self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.get_artifact("submission"))
-        self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.get_artifact("feature_importance_df"))
-        self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
-        self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
-        self._save_pickle_local(exp_prefix + "model.pkl", pipeline.get_artifact("model"))
-        self._save_pickle_local(exp_prefix + "df_subset.pkl", pipeline.df)
-        
-        log_local_path = pipeline.log_filename
-        if os.path.exists(log_local_path):
-            log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
-            os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
-            import shutil
-            shutil.copy2(log_local_path, log_dest_path)
-            
+        # Guardar DataFrames si existen
+        if hasattr(pipeline, "submission") and pipeline.submission is not None:
+            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
+
+        if hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
+            self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
+
+        if hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
+            self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
+
+        # Guardar modelo
+        if hasattr(pipeline, "model") and pipeline.model is not None:
+            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+
+        # Guardar total_error si existe
+        if total_error is not None:
+            self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
+
+        # Guardar DataFrame final
+        if hasattr(pipeline, "df") and pipeline.df is not None:
+            self._save_pickle_local(exp_prefix + "df_procesamiento_2.pkl", pipeline.df)
+
+        # Guardar log si existe
+        if hasattr(pipeline, "log_filename"):
+            log_local_path = pipeline.log_filename
+            if log_local_path and os.path.exists(log_local_path):
+                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+                os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
+                shutil.copy2(log_local_path, log_dest_path)            
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" # Nombre del experimento que inicia todo. 
+experiment_name = "exp_lgbm_20250701_2307" # Nombre del experimento que inicia todo. 
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_final.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Cambiar por el path correcto del pickle
         SubsetStep(),
         DateRelatedFeaturesStep(),
         CastDataTypesStep(dtypes=
             {
-                "product_id": "uint32", 
-                "customer_id": "uint32",
                 "mes": "uint16",
                 "quarter": "uint16",
                 "year": "uint16",
                 "periodo": "uint16",
             }),
-        CountZeroPeriodsInWindowStep(tn_columns=["tn"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
-        FeatureEngineeringLagStep(lags=[1,2,3], columns=["tn"]),
-        #FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
+        CountZeroPeriodsInWindowStep(tn_columns=["tn"], windows=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
+        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
         RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         RollingMaxFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         RollingMinFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingStdFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
@@ -1950,8 +1963,32 @@ pipeline = Pipeline(
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        SaveResults(exp_name=experiment_name, save_dataframes=True),
-        ReduceMemoryUsageStep()
+        ReduceMemoryUsageStep(),
+        SaveResults(exp_name=experiment_name),
     ],
     experiment_name=experiment_name,
     )
+
+try:
+    pipeline.run(verbose=True)
+
+except Exception as e:
+    pipeline.logger.error("Pipeline failed with an exception:", exc_info=True)
+
+finally:
+    try:
+        local_log_path = pipeline.log_filename
+        # Ruta dentro del bucket montado localmente
+        bucket_mounted_path = "/home/tomifernandezlabo3/gcs-bucket"
+        log_dest_dir = os.path.join(bucket_mounted_path, "experiments", experiment_name)
+        os.makedirs(log_dest_dir, exist_ok=True)
+
+        log_dest_path = os.path.join(log_dest_dir, "pipeline_log.txt")
+
+        if os.path.exists(local_log_path):
+            shutil.copy2(local_log_path, log_dest_path)
+            print(f"Log file copied to mounted bucket path: {log_dest_path}")
+
+    except Exception as log_upload_error:
+        print("Error copying log to mounted bucket path:", log_upload_error)
+        traceback.print_exc()

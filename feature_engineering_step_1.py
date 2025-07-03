@@ -1774,7 +1774,6 @@ class SaveResults(PipelineStep):
     Guarda los resultados relevantes de cada experimento directamente en la carpeta local
     donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
     """
-    # Ruta fija donde está montado el bucket de GCS
     BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
 
     def __init__(self, exp_name: str, name: Optional[str] = None):
@@ -1800,26 +1799,42 @@ class SaveResults(PipelineStep):
             with open(full_path, "wb") as f:
                 pickle.dump(obj, f)
 
-    def execute(self, pipeline: Pipeline) -> None:
-        total_error = pipeline.get_artifact("total_error")
-        exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+    def execute(self, pipeline) -> None:
+        total_error = getattr(pipeline, "total_error", None)
+        if total_error is not None:
+            exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+        else:
+            exp_prefix = f"experiments/{self.exp_name}/"
 
-        self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.get_artifact("submission"))
-        self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.get_artifact("feature_importance_df"))
-        self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.get_artifact("optuna_trials_df"))
-        self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
-        self._save_pickle_local(exp_prefix + "model.pkl", pipeline.get_artifact("model"))
-    
-        #Guardar el DataFrame final
-        self._save_pickle_local(exp_prefix + "df_procesamiento_1.pkl", pipeline.df)
-        
-        log_local_path = pipeline.log_filename
-        if os.path.exists(log_local_path):
-            log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
-            os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
-            import shutil
-            shutil.copy2(log_local_path, log_dest_path)
-            
+        # Guardar DataFrames si existen
+        if hasattr(pipeline, "submission") and pipeline.submission is not None:
+            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
+
+        if hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
+            self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
+
+        if hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
+            self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
+
+        # Guardar modelo
+        if hasattr(pipeline, "model") and pipeline.model is not None:
+            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+
+        # Guardar total_error si existe
+        if total_error is not None:
+            self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
+
+        # Guardar DataFrame final
+        if hasattr(pipeline, "df") and pipeline.df is not None:
+            self._save_pickle_local(exp_prefix + "df_procesamiento_1.pkl", pipeline.df)
+
+        # Guardar log si existe
+        if hasattr(pipeline, "log_filename"):
+            log_local_path = pipeline.log_filename
+            if log_local_path and os.path.exists(log_local_path):
+                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+                os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
+                shutil.copy2(log_local_path, log_dest_path)        
                     
 #### ---- Pipeline Execution ---- ####
 experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
