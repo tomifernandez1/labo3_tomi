@@ -1878,7 +1878,8 @@ class SaveResults(PipelineStep):
         self._save_dataframe_local(exp_prefix + "optuna_trials.csv", optuna_trials_df)
 
         # Guardar total error y otros datos
-        self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
+        if total_error is not None:
+            self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
 
         # Guardar modelo desde memoria
         try:
