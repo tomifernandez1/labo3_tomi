@@ -2075,7 +2075,7 @@ pipeline = Pipeline(
         SplitDataFrameStep(),
         PrepareXYStep(),
         OptunaLGBMOptimizationStep(n_trials=2),
-        SaveResults()
+        SaveResults(exp_name=experiment_name),
     ],
     experiment_name=experiment_name,
     )
