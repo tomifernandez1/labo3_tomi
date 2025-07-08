@@ -2000,6 +2000,14 @@ experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento 
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        CastDataTypesStep(dtypes=
+            {
+                "edad_customer_producto": "float32", 
+                "periodos_desde_ultima_compra": "float32",
+            }
+        ),
+        CustomScalerStep(),
+        ScaleTnDerivedFeaturesStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
         LoadBestOptunaParamsStep(exp_name=experiment_name),

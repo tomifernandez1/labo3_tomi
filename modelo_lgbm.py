@@ -1943,8 +1943,8 @@ class SaveResults(PipelineStep):
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
 
         # Guardar DataFrame final
-        if hasattr(pipeline, "df") and pipeline.df is not None:
-            self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
+        #if hasattr(pipeline, "df") and pipeline.df is not None:
+        #    self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
 
         # Guardar log si existe
         if hasattr(pipeline, "log_filename"):
