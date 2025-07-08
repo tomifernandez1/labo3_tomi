@@ -2015,10 +2015,10 @@ class SaveResults(PipelineStep):
                 shutil.copy2(log_local_path, log_dest_path)            
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_20250701_2307" # Nombre del experimento que inicia todo. 
+experiment_name = "exp_lgbm_target_delta_20250708_0105" # Nombre del experimento que inicia todo. 
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Levantar el df con FEE para proceder a escalar. 
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_procesamiento_1.pkl"), ## Levantar el df con FEE para proceder a escalar. 
         CustomScalerStep(),
         ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),
