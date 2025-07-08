@@ -314,6 +314,7 @@ class LoadDataFrameStep(PipelineStep):
 class LoadDataFrameFromPickleStep(PipelineStep):
     """
     Carga un DataFrame desde un archivo .pkl y lo guarda en pipeline.df.
+    Si encuentra una columna que contenga 'target' en el nombre, la renombra a 'target'.
     """
     def __init__(self, path: str, name: Optional[str] = None):
         super().__init__(name)
@@ -324,6 +325,14 @@ class LoadDataFrameFromPickleStep(PipelineStep):
             raise FileNotFoundError(f"No se encontró el archivo: {self.path}")
         
         df = pd.read_pickle(self.path)
+
+        # Renombrar columnas que contengan 'target' en el nombre a 'target'
+        target_cols = [col for col in df.columns if 'target' in col.lower()]
+        if target_cols:
+            # Solo mantener la primera que se encuentra
+            print(f"Renombrando columna '{target_cols[0]}' a 'target'")
+            df.rename(columns={target_cols[0]: 'target'}, inplace=True)
+
         pipeline.df = df
         print(f"DataFrame cargado desde: {self.path} (shape: {df.shape})")
         
@@ -1883,7 +1892,6 @@ class SaveResults(PipelineStep):
     Guarda los resultados relevantes de cada experimento directamente en la carpeta local
     donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
     """
-    # Ruta fija donde está montado el bucket de GCS
     BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
 
     def __init__(self, exp_name: str, name: Optional[str] = None):
@@ -1909,66 +1917,51 @@ class SaveResults(PipelineStep):
             with open(full_path, "wb") as f:
                 pickle.dump(obj, f)
 
-    def execute(self, pipeline: Pipeline) -> None:
-        # Obtener datos directamente de la memoria del pipeline
-        total_error = pipeline.total_error
-        exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+    def execute(self, pipeline) -> None:
+        total_error = getattr(pipeline, "total_error", None)
+        if total_error is not None:
+            exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+        else:
+            exp_prefix = f"experiments/{self.exp_name}/"
 
-        # Guardar submission desde memoria
-        try:
-            submission = pipeline.submission
-        except AttributeError:
-            submission = pipeline.get_artifact("submission")
-        self._save_dataframe_local(exp_prefix + "submission.csv", submission)
+        # Guardar DataFrames si existen
+        if hasattr(pipeline, "submission") and pipeline.submission is not None:
+            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
 
-        # Guardar feature importance desde memoria
-        try:
-            feature_importance_df = pipeline.feature_importance_df
-        except AttributeError:
-            feature_importance_df = pipeline.get_artifact("feature_importance_df")
-        self._save_dataframe_local(exp_prefix + "feature_importance.csv", feature_importance_df)
+        if hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
+            self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
 
-        # Guardar optuna trials desde memoria
-        try:
-            optuna_trials_df = pipeline.optuna_trials_df
-        except AttributeError:
-            optuna_trials_df = pipeline.get_artifact("optuna_trials_df")
-        self._save_dataframe_local(exp_prefix + "optuna_trials.csv", optuna_trials_df)
+        if hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
+            self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
 
-        # Guardar total error y otros datos
+        # Guardar modelo
+        if hasattr(pipeline, "model") and pipeline.model is not None:
+            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+
+        # Guardar total_error si existe
         if total_error is not None:
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
 
-        # Guardar modelo desde memoria
-        try:
-            model = pipeline.model
-        except AttributeError:
-            model = pipeline.get_artifact("model")
-        self._save_pickle_local(exp_prefix + "model.pkl", model)
+        # Guardar DataFrame final
+        if hasattr(pipeline, "df") and pipeline.df is not None:
+            self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
 
-        # Guardar dataframe principal
-        #self._save_pickle_local(exp_prefix + "df_procesamiento_2.pkl", pipeline.df)
-        
-        # Copiar log file
-        log_local_path = pipeline.log_filename
-        if os.path.exists(log_local_path):
-            log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
-            os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
-            import shutil
-            shutil.copy2(log_local_path, log_dest_path)   
-                
-        # Guardar mejores parámetros de Optuna en JSON
-        try:
-            best_params = pipeline.best_params
-            best_num_boost_rounds = pipeline.best_num_boost_rounds
+        # Guardar log si existe
+        if hasattr(pipeline, "log_filename"):
+            log_local_path = pipeline.log_filename
+            if log_local_path and os.path.exists(log_local_path):
+                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+                os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
+                shutil.copy2(log_local_path, log_dest_path)
+
+        # Guardar mejores parámetros si están definidos
+        if hasattr(pipeline, "best_params") and hasattr(pipeline, "best_num_boost_rounds"):
             best_config = {
-                "best_params": best_params,
-                "best_num_boost_rounds": best_num_boost_rounds
+                "best_params": pipeline.best_params,
+                "best_num_boost_rounds": pipeline.best_num_boost_rounds
             }
             self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
-        except AttributeError:
-            pipeline.logger.warning("Best Optuna parameters not found. Skipping save.")
-            
+
 class CustomScalerStep(PipelineStep):
     """
     Calcula el std por serie (product_id, customer_id) usando solo datos
@@ -2072,9 +2065,15 @@ pipeline = Pipeline(
         ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),        
         WeightedSubsampleSeriesStep(),
+        CastDataTypesStep(dtypes=
+            {
+                "edad_customer_producto": "float32", 
+                "periodos_desde_ultima_compra": "float32",
+            }
+        ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=2),
+        OptunaLGBMOptimizationStep(n_trials=1, study_name=experiment_name),
         SaveResults(exp_name=experiment_name),
     ],
     experiment_name=experiment_name,

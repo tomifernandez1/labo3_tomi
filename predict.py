@@ -313,6 +313,7 @@ class LoadDataFrameStep(PipelineStep):
 class LoadDataFrameFromPickleStep(PipelineStep):
     """
     Carga un DataFrame desde un archivo .pkl y lo guarda en pipeline.df.
+    Si encuentra una columna que contenga 'target' en el nombre, la renombra a 'target'.
     """
     def __init__(self, path: str, name: Optional[str] = None):
         super().__init__(name)
@@ -323,6 +324,14 @@ class LoadDataFrameFromPickleStep(PipelineStep):
             raise FileNotFoundError(f"No se encontró el archivo: {self.path}")
         
         df = pd.read_pickle(self.path)
+
+        # Renombrar columnas que contengan 'target' en el nombre a 'target'
+        target_cols = [col for col in df.columns if 'target' in col.lower()]
+        if target_cols:
+            # Solo mantener la primera que se encuentra
+            print(f"Renombrando columna '{target_cols[0]}' a 'target'")
+            df.rename(columns={target_cols[0]: 'target'}, inplace=True)
+
         pipeline.df = df
         print(f"DataFrame cargado desde: {self.path} (shape: {df.shape})")
         
