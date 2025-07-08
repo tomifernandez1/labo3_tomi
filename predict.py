@@ -1987,10 +1987,10 @@ class SaveResults(PipelineStep):
             shutil.copy2(log_local_path, log_dest_path)            
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_fe.pkl"), ## Cambiar por el path correcto del pickle
         SplitDataFrameStep(),
         PrepareXYStep(),
         LoadBestOptunaParamsStep(exp_name=experiment_name),

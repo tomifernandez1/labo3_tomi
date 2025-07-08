@@ -1396,13 +1396,13 @@ class OptunaLGBMOptimizationStep(PipelineStep):
                 param = {
                     'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
-                    'max_depth': trial.suggest_int('max_depth', 3, 10),
+                    'max_depth': trial.suggest_int('max_depth', 3, 15),
                     'random_state': 42,
                     'boosting_type': 'gbdt',
-                    'objective': 'tweedie',
-                    'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
-                    'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
-                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
+                    'objective': 'regression',
+                    #'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
+                    'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 0.9),
+                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 0.9),
                     'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
                     'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
                     'verbose': -1,
@@ -1967,18 +1967,114 @@ class SaveResults(PipelineStep):
             }
             self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
         except AttributeError:
-            pipeline.logger.warning("Best Optuna parameters not found. Skipping save.")            
+            pipeline.logger.warning("Best Optuna parameters not found. Skipping save.")
+            
+class CustomScalerStep(PipelineStep):
+    """
+    Calcula el std por serie (product_id, customer_id) usando solo datos
+    hasta el periodo máximo definido (fecha <= max_period).
+    Usa fallback al std por producto si std_cust_prod es bajo.
+    Guarda en pipeline.scaler un DataFrame con ['product_id', 'customer_id', 'std_final'].
+    
+    Args:
+        min_std_threshold (float): umbral para considerar std suficientemente alto.
+        max_period (str or pd.Timestamp): fecha límite para filtrar datos (inclusive).
+            Ejemplo: '2019-08'
+    """
+    def __init__(self, min_std_threshold: float = 0.001,
+                 max_period: str = '2019-08',
+                 name: Optional[str] = None):
+        super().__init__(name)
+        self.min_std_threshold = min_std_threshold
+        self.max_period = max_period
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        # Verificar tipo de dato de 'fecha' y convertir a datetime solo si es necesario
+        if isinstance(df['fecha'].dtype, pd.PeriodDtype):
+            fecha_ts = df['fecha'].dt.to_timestamp()
+        else:
+            fecha_ts = pd.to_datetime(df['fecha'], format="%Y-%m")
+
+        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
+
+        # Filtrar solo datos hasta max_period (inclusive)
+        df_filtered = df[fecha_ts <= max_period_dt]
+
+        # Calcular std por (product_id, customer_id) con datos filtrados
+        std_cust_prod = df_filtered.groupby(['product_id', 'customer_id'])['tn'].std().reset_index()
+        std_cust_prod.rename(columns={'tn': 'std_cust_prod'}, inplace=True)
+
+        # Calcular std por product_id con datos filtrados
+        std_prod = df_filtered.groupby('product_id')['tn'].std().reset_index()
+        std_prod.rename(columns={'tn': 'std_prod'}, inplace=True)
+
+        # Merge
+        scaler_df = std_cust_prod.merge(std_prod, on='product_id', how='left')
+
+        # Crear std_final
+        mask = (scaler_df['std_cust_prod'].isna()) | (scaler_df['std_cust_prod'] < self.min_std_threshold)
+        scaler_df['std_final'] = scaler_df['std_cust_prod']
+        scaler_df.loc[mask, 'std_final'] = scaler_df.loc[mask, 'std_prod']
+        scaler_df['std_final'] = scaler_df['std_final'].fillna(1.0)
+
+        # Guardar solo columnas necesarias
+        pipeline.scaler = scaler_df[['product_id', 'customer_id', 'std_final']]
+  
+class ScaleTnDerivedFeaturesStep(PipelineStep):
+    """
+    Escala columnas derivadas de 'tn' (lags, rolling stats y diferencias absolutas relacionadas a tn)
+    usando el std_final guardado en pipeline.scaler para cada (product_id, customer_id).
+    Crea nuevas columnas con sufijo '_scaled' sin modificar las originales.
+    """
+    def __init__(self, name: Optional[str] = None, base_feature_prefix='tn'):
+        super().__init__(name)
+        self.base_feature_prefix = base_feature_prefix  # Ejemplo: 'tn'
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        if not hasattr(pipeline, "scaler"):
+            raise ValueError("pipeline.scaler no está definido. Ejecutá CustomScalerStep primero.")
+
+        scaler_df = pipeline.scaler
+
+        # Merge para agregar std_final a cada fila según product_id y customer_id
+        df = df.merge(scaler_df, on=['product_id', 'customer_id'], how='left')
+
+        # Columnas a escalar: lags, rolling, y diferencias que se basen en la feature base (ej. 'tn')
+        cols_to_scale = []
+        for col in df.columns:
+            if (
+                (col.startswith(f"{self.base_feature_prefix}_lag_") or
+                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
+                 (f"{self.base_feature_prefix}_diff_" in col))
+            ):
+                cols_to_scale.append(col)
+
+        for col in cols_to_scale:
+            df[f"{col}_scaled"] = df[col] / df['std_final']
+
+        # Eliminar columna temporal
+        df.drop(columns=['std_final'], inplace=True)
+
+        pipeline.df = df
+                        
                  
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        CustomScalerStep(),
+        ScaleTnDerivedFeaturesStep(),
+        ReduceMemoryUsageStep(),        
         WeightedSubsampleSeriesStep(),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=300),
+        OptunaLGBMOptimizationStep(n_trials=2),
         SaveResults()
     ],
     experiment_name=experiment_name,
