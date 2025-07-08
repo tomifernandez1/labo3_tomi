@@ -27,7 +27,6 @@ import logging
 import shutil
 import traceback
 from optuna.exceptions import TrialPruned
-import json
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -353,7 +352,7 @@ class WeightedSubsampleSeriesStep(PipelineStep):
             .reset_index(name="avg_tn")
         )
         # 2. Normalizar pesos
-        series_avg_tn["sampling_weight"] = series_avg_tn["avg_tn"]
+        series_avg_tn["sampling_weight"] = series_avg_tn["avg_tn"] #/ series_avg_tn["avg_tn"].sum()
         # 3. Muestrear series con probabilidad proporcional al promedio
         sampled_series = series_avg_tn.sample(
             frac=self.sample_fraction,
@@ -1339,7 +1338,7 @@ class TrainModelLGBStep(PipelineStep):
         eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
         custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
         callbacks = [
-            lgb.early_stopping(250),
+            lgb.early_stopping(200),
             lgb.log_evaluation(100),
         ]
         model = lgb.train(
@@ -1392,7 +1391,7 @@ class OptunaLGBMOptimizationStep(PipelineStep):
             try:
                 train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features)
                 eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
-                callbacks = [lgb.early_stopping(250)]
+                callbacks = [lgb.early_stopping(200)]
                 param = {
                     'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
                     'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
@@ -1669,6 +1668,36 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
 
         # Guardar modelo en memoria
         pipeline.model = model        
+        
+class LoadBestOptunaParamsStep(PipelineStep):
+    """
+    Carga los mejores parámetros de Optuna desde un archivo JSON previamente guardado
+    y los deja disponibles en el pipeline como `pipeline.best_params` y `pipeline.best_num_boost_rounds`.
+    """
+    
+    BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
+
+    def __init__(self, exp_name: str, name: Optional[str] = None):
+        super().__init__(name)
+        self.exp_name = exp_name
+
+    def execute(self, pipeline: Pipeline) -> None:
+        # Buscar carpeta del experimento
+        exp_prefix = f"experiments/{self.exp_name}/"
+        json_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix, "best_params.json")
+
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"No se encontró el archivo de parámetros: {json_path}")
+
+        # Cargar archivo
+        with open(json_path, "r") as f:
+            config = json.load(f)
+
+        # Asignar al pipeline
+        pipeline.best_params = config["best_params"]
+        pipeline.best_num_boost_rounds = config["best_num_boost_rounds"]
+
+        pipeline.logger.info("Best Optuna parameters loaded into pipeline.")
         
 class SaveFeatureImportanceStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
@@ -1955,30 +1984,20 @@ class SaveResults(PipelineStep):
             log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
             os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
             import shutil
-            shutil.copy2(log_local_path, log_dest_path)   
-                
-        # Guardar mejores parámetros de Optuna en JSON
-        try:
-            best_params = pipeline.best_params
-            best_num_boost_rounds = pipeline.best_num_boost_rounds
-            best_config = {
-                "best_params": best_params,
-                "best_num_boost_rounds": best_num_boost_rounds
-            }
-            self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
-        except AttributeError:
-            pipeline.logger.warning("Best Optuna parameters not found. Skipping save.")            
-                 
+            shutil.copy2(log_local_path, log_dest_path)            
                     
 #### ---- Pipeline Execution ---- ####
 experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_xxxx/df_fe.pkl"), ## Cambiar por el path correcto del pickle
-        WeightedSubsampleSeriesStep(),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=300),
+        LoadBestOptunaParamsStep(exp_name=experiment_name),
+        TrainFinalModelLGBKaggleStep(),
+        SaveFeatureImportanceStep(),
+        FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
+        KaggleSubmissionStep(),
         SaveResults()
     ],
     experiment_name=experiment_name,

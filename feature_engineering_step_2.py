@@ -374,11 +374,11 @@ class WeightedSubsampleSeriesStep(PipelineStep):
             .reset_index(name="avg_tn")
         )
         # 2. Normalizar pesos
-        series_avg_tn["sampling_prob"] = series_avg_tn["avg_tn"] / series_avg_tn["avg_tn"].sum()
+        series_avg_tn["sampling_weight"] = series_avg_tn["avg_tn"] #/ series_avg_tn["avg_tn"].sum()
         # 3. Muestrear series con probabilidad proporcional al promedio
         sampled_series = series_avg_tn.sample(
             frac=self.sample_fraction,
-            weights="sampling_prob",
+            weights="sampling_weight",
             random_state=self.random_state
         )
         # 4. Filtrar dataset original
@@ -890,6 +890,96 @@ class FeatureEngineeringProductCatInteractionStep(PipelineStep):
         df = df.merge(df_cat, on="fecha", how="left")
         pipeline.df = df
         
+class CustomScalerStep(PipelineStep):
+    """
+    Calcula el std por serie (product_id, customer_id) usando solo datos
+    hasta el periodo máximo definido (fecha <= max_period).
+    Usa fallback al std por producto si std_cust_prod es bajo.
+    Guarda en pipeline.scaler un DataFrame con ['product_id', 'customer_id', 'std_final'].
+    
+    Args:
+        min_std_threshold (float): umbral para considerar std suficientemente alto.
+        max_period (str or pd.Timestamp): fecha límite para filtrar datos (inclusive).
+            Ejemplo: '2019-08'
+    """
+    def __init__(self, min_std_threshold: float = 0.001,
+                 max_period: str = '2019-08',
+                 name: Optional[str] = None):
+        super().__init__(name)
+        self.min_std_threshold = min_std_threshold
+        self.max_period = max_period
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        # Asegurar que 'fecha' esté en formato datetime para filtrar correctamente
+        if not pd.api.types.is_datetime64_any_dtype(df['fecha']):
+            df['fecha'] = pd.to_datetime(df['fecha'], format="%Y-%m")
+
+        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
+
+        # Filtrar solo datos hasta max_period (inclusive)
+        df_filtered = df[df['fecha'] <= max_period_dt]
+
+        # Calcular std por (product_id, customer_id) con datos filtrados
+        std_cust_prod = df_filtered.groupby(['product_id', 'customer_id'])['tn'].std().reset_index()
+        std_cust_prod.rename(columns={'tn': 'std_cust_prod'}, inplace=True)
+
+        # Calcular std por product_id con datos filtrados
+        std_prod = df_filtered.groupby('product_id')['tn'].std().reset_index()
+        std_prod.rename(columns={'tn': 'std_prod'}, inplace=True)
+
+        # Merge
+        scaler_df = std_cust_prod.merge(std_prod, on='product_id', how='left')
+
+        # Crear std_final
+        mask = (scaler_df['std_cust_prod'].isna()) | (scaler_df['std_cust_prod'] < self.min_std_threshold)
+        scaler_df['std_final'] = scaler_df['std_cust_prod']
+        scaler_df.loc[mask, 'std_final'] = scaler_df.loc[mask, 'std_prod']
+        scaler_df['std_final'] = scaler_df['std_final'].fillna(1.0)
+
+        # Guardar solo columnas necesarias
+        pipeline.scaler = scaler_df[['product_id', 'customer_id', 'std_final']]
+        
+class ScaleTnDerivedFeaturesStep(PipelineStep):
+    """
+    Escala columnas derivadas de 'tn' (lags, rolling stats y diferencias absolutas relacionadas a tn)
+    usando el std_final guardado en pipeline.scaler para cada (product_id, customer_id).
+    Crea nuevas columnas con sufijo '_scaled' sin modificar las originales.
+    """
+    def __init__(self, name: Optional[str] = None, base_feature_prefix='tn'):
+        super().__init__(name)
+        self.base_feature_prefix = base_feature_prefix  # Ejemplo: 'tn'
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        if not hasattr(pipeline, "scaler"):
+            raise ValueError("pipeline.scaler no está definido. Ejecutá CustomScalerStep primero.")
+
+        scaler_df = pipeline.scaler
+
+        # Merge para agregar std_final a cada fila según product_id y customer_id
+        df = df.merge(scaler_df, on=['product_id', 'customer_id'], how='left')
+
+        # Columnas a escalar: lags, rolling, y diferencias que se basen en la feature base (ej. 'tn')
+        cols_to_scale = []
+        for col in df.columns:
+            if (
+                (col.startswith(f"{self.base_feature_prefix}_lag_") or
+                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
+                 (f"{self.base_feature_prefix}_diff_" in col))
+            ):
+                cols_to_scale.append(col)
+
+        for col in cols_to_scale:
+            df[f"{col}_scaled"] = df[col] / df['std_final']
+
+        # Eliminar columna temporal
+        df.drop(columns=['std_final'], inplace=True)
+
+        pipeline.df = df
+                
 class OutlierPasoFeatureStep(PipelineStep):
     def __init__(self, fecha_outlier: str = "2019-08-01", name: Optional[str] = None):
         super().__init__(name)
@@ -1248,12 +1338,12 @@ class SplitDataFrameStep(PipelineStep):
         train = df[(df["fecha"] < last_train_date)]
         df_final = df[df["fecha"] <= last_test_date] # Incluye Octubre para Kaggle
         df_intermedio = df[df["fecha"] <= last_train_date] # Incluye Septiembre para testear Octubre
-        self.save_artifact(pipeline, "train", train)
-        self.save_artifact(pipeline, "eval_data", eval_data)
-        self.save_artifact(pipeline, "test", test)
-        self.save_artifact(pipeline, "kaggle_pred", kaggle_pred)
-        self.save_artifact(pipeline, "df_intermedio", df_intermedio)
-        self.save_artifact(pipeline, "df_final", df_final)
+        pipeline.train = train
+        pipeline.eval_data = eval_data
+        pipeline.test = test
+        pipeline.kaggle_pred = kaggle_pred
+        pipeline.df_intermedio = df_intermedio
+        pipeline.df_final = df_final
 
 
 class CustomMetric:
@@ -1286,12 +1376,12 @@ class PrepareXYStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        train = pipeline.get_artifact("train")
-        eval_data = pipeline.get_artifact("eval_data")
-        test = pipeline.get_artifact("test")
-        kaggle_pred = pipeline.get_artifact("kaggle_pred")
-        df_intermedio = pipeline.get_artifact("df_intermedio")
-        df_final = pipeline.get_artifact("df_final")
+        train = pipeline.train
+        eval_data = pipeline.eval_data
+        test = pipeline.test
+        kaggle_pred = pipeline.kaggle_pred
+        df_intermedio = pipeline.df_intermedio
+        df_final = pipeline.df_final
 
         features = [col for col in train.columns if col not in
                         ['fecha', 'target']]
@@ -1316,19 +1406,19 @@ class PrepareXYStep(PipelineStep):
         X_train_intermedio = df_intermedio[features]
         y_train_intermedio = df_intermedio[target]
                 
-        self.save_artifact(pipeline, "X_train", X_train)
-        self.save_artifact(pipeline, "y_train", y_train)
-        self.save_artifact(pipeline, "X_train_alone", X_train_alone)
-        self.save_artifact(pipeline, "y_train_alone", y_train_alone)
-        self.save_artifact(pipeline, "X_eval", X_eval)
-        self.save_artifact(pipeline, "y_eval", y_eval)
-        self.save_artifact(pipeline, "X_test", X_test)
-        self.save_artifact(pipeline, "y_test", y_test)
-        self.save_artifact(pipeline, "X_train_intermedio", X_train_intermedio)
-        self.save_artifact(pipeline, "y_train_intermedio", y_train_intermedio)
-        self.save_artifact(pipeline, "X_train_final", X_train_final)
-        self.save_artifact(pipeline, "y_train_final", y_train_final)
-        self.save_artifact(pipeline, "X_kaggle", X_kaggle)
+        pipeline.X_train = X_train
+        pipeline.y_train = y_train
+        pipeline.X_train_alone = X_train_alone
+        pipeline.y_train_alone = y_train_alone
+        pipeline.X_eval = X_eval
+        pipeline.y_eval = y_eval
+        pipeline.X_test = X_test
+        pipeline.y_test = y_test
+        pipeline.X_train_intermedio = X_train_intermedio
+        pipeline.y_train_intermedio = y_train_intermedio
+        pipeline.X_train_final = X_train_final
+        pipeline.y_train_final = y_train_final
+        pipeline.X_kaggle = X_kaggle
         
 
 class TrainModelLGBStep(PipelineStep):
@@ -1912,7 +2002,7 @@ class SaveResults(PipelineStep):
 
         # Guardar DataFrame final
         if hasattr(pipeline, "df") and pipeline.df is not None:
-            self._save_pickle_local(exp_prefix + "df_sampled_fe.pkl", pipeline.df)
+            self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
 
         # Guardar log si existe
         if hasattr(pipeline, "log_filename"):
@@ -1927,7 +2017,6 @@ experiment_name = "exp_lgbm_20250701_2307" # Nombre del experimento que inicia t
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Cambiar por el path correcto del pickle
-        WeightedSubsampleSeriesStep(sample_fraction=0.30),
         DateRelatedFeaturesStep(),
         CastDataTypesStep(dtypes=
             {
@@ -1938,9 +2027,9 @@ pipeline = Pipeline(
             }),
         CountZeroPeriodsInWindowStep(tn_columns=["tn"], windows=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
         FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
-        RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingMaxFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
-        RollingMinFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn"]),
+        RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
+        RollingMaxFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
+        RollingMinFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
@@ -1949,6 +2038,8 @@ pipeline = Pipeline(
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
         DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        CustomScalerStep(),
+        ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),
         SaveResults(exp_name=experiment_name),
     ],

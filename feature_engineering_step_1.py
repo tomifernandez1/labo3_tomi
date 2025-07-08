@@ -1837,10 +1837,10 @@ class SaveResults(PipelineStep):
                 shutil.copy2(log_local_path, log_dest_path)        
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = f"exp_lgbm_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
+experiment_name = f"exp_lgbm_target_delta_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameStep(path="/home/tomifernandezlabo3/gcs-bucket/df_inicial.parquet"),
+        LoadDataFrameStep(path="/home/tomifernandezlabo3/gcs-bucket/df_inicial_target_delta.parquet"),
         ReduceMemoryUsageStep(),
         CastDataTypesStep(dtypes=
             {
