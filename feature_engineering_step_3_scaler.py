@@ -896,7 +896,7 @@ class CustomScalerStep(PipelineStep):
     hasta el periodo máximo definido (fecha <= max_period).
     Usa fallback al std por producto si std_cust_prod es bajo.
     Guarda en pipeline.scaler un DataFrame con ['product_id', 'customer_id', 'std_final'].
-
+    
     Args:
         min_std_threshold (float): umbral para considerar std suficientemente alto.
         max_period (str or pd.Timestamp): fecha límite para filtrar datos (inclusive).
@@ -910,46 +910,39 @@ class CustomScalerStep(PipelineStep):
         self.max_period = max_period
 
     def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.df.copy()
+        df = pipeline.df
 
-        # Convertir max_period a datetime
-        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
-
-        # Convertir 'fecha' a datetime solo para el filtro, sin modificar la original
-        if pd.api.types.is_period_dtype(df['fecha']):
+        # Verificar tipo de dato de 'fecha' y convertir a datetime solo si es necesario
+        if isinstance(df['fecha'].dtype, pd.PeriodDtype):
             fecha_ts = df['fecha'].dt.to_timestamp()
         else:
-            fecha_ts = pd.to_datetime(df['fecha'])
+            fecha_ts = pd.to_datetime(df['fecha'], format="%Y-%m")
 
-        # Filtrar hasta la fecha límite
+        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
+
+        # Filtrar solo datos hasta max_period (inclusive)
         df_filtered = df[fecha_ts <= max_period_dt]
 
-        # Calcular std por (product_id, customer_id)
-        std_cust_prod = (
-            df_filtered.groupby(['product_id', 'customer_id'])['tn']
-            .std()
-            .reset_index()
-            .rename(columns={'tn': 'std_cust_prod'})
-        )
+        # Calcular std por (product_id, customer_id) con datos filtrados
+        std_cust_prod = df_filtered.groupby(['product_id', 'customer_id'])['tn'].std().reset_index()
+        std_cust_prod.rename(columns={'tn': 'std_cust_prod'}, inplace=True)
 
-        # Calcular std por product_id
-        std_prod = (
-            df_filtered.groupby('product_id')['tn']
-            .std()
-            .reset_index()
-            .rename(columns={'tn': 'std_prod'})
-        )
+        # Calcular std por product_id con datos filtrados
+        std_prod = df_filtered.groupby('product_id')['tn'].std().reset_index()
+        std_prod.rename(columns={'tn': 'std_prod'}, inplace=True)
 
-        # Merge y cálculo de std_final
+        # Merge
         scaler_df = std_cust_prod.merge(std_prod, on='product_id', how='left')
+
+        # Crear std_final
         mask = (scaler_df['std_cust_prod'].isna()) | (scaler_df['std_cust_prod'] < self.min_std_threshold)
         scaler_df['std_final'] = scaler_df['std_cust_prod']
         scaler_df.loc[mask, 'std_final'] = scaler_df.loc[mask, 'std_prod']
         scaler_df['std_final'] = scaler_df['std_final'].fillna(1.0)
 
-        # Guardar en pipeline
+        # Guardar solo columnas necesarias
         pipeline.scaler = scaler_df[['product_id', 'customer_id', 'std_final']]
-        
+  
 class ScaleTnDerivedFeaturesStep(PipelineStep):
     """
     Escala columnas derivadas de 'tn' (lags, rolling stats y diferencias absolutas relacionadas a tn)
