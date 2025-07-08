@@ -2011,7 +2011,7 @@ class SaveResults(PipelineStep):
 
         # Guardar DataFrame final
         if hasattr(pipeline, "df") and pipeline.df is not None:
-            self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
+            self._save_pickle_local(exp_prefix + "df_fe_scaled.pkl", pipeline.df)
 
         # Guardar log si existe
         if hasattr(pipeline, "log_filename"):
@@ -2025,28 +2025,9 @@ class SaveResults(PipelineStep):
 experiment_name = "exp_lgbm_20250701_2307" # Nombre del experimento que inicia todo. 
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Cambiar por el path correcto del pickle
-        DateRelatedFeaturesStep(),
-        CastDataTypesStep(dtypes=
-            {
-                "mes": "uint16",
-                "quarter": "uint16",
-                "year": "uint16",
-                "periodo": "uint16",
-            }),
-        CountZeroPeriodsInWindowStep(tn_columns=["tn"], windows=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
-        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
-        RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        RollingMaxFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        RollingMinFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_20250701_2307/df_procesamiento_1.pkl"), ## Levantar el df con FEE para proceder a escalar. 
+        CustomScalerStep(),
+        ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),
         SaveResults(exp_name=experiment_name),
     ],
