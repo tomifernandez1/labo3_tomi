@@ -1891,12 +1891,23 @@ class SaveResults(PipelineStep):
     """
     Guarda los resultados relevantes de cada experimento directamente en la carpeta local
     donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
+    Permite parametrizar qué artefactos guardar basándose en atributos directos del pipeline.
     """
     BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
 
-    def __init__(self, exp_name: str, name: Optional[str] = None):
+    def __init__(self, exp_name: str, to_save=None, name: Optional[str] = None):
+        """
+        to_save: lista o set con strings que indiquen qué guardar. 
+                 Opciones: "submission", "feature_importance", "optuna_trials", "total_error",
+                           "model", "log", "best_params"
+                 Si es None, guarda todo.
+        """
         super().__init__(name)
         self.exp_name = exp_name
+        self.to_save = set(to_save) if to_save is not None else {
+            "submission", "feature_importance", "optuna_trials", "total_error",
+            "model", "log", "best_params","df","scaler"
+        }
 
     def _save_string_local(self, relative_path, content: str):
         full_path = os.path.join(self.BASE_BUCKET_PATH, relative_path)
@@ -1924,44 +1935,41 @@ class SaveResults(PipelineStep):
         else:
             exp_prefix = f"experiments/{self.exp_name}/"
 
-        # Guardar DataFrames si existen
-        if hasattr(pipeline, "submission") and pipeline.submission is not None:
+        if "submission" in self.to_save and hasattr(pipeline, "submission") and pipeline.submission is not None:
             self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
 
-        if hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
+        if "feature_importance" in self.to_save and hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
             self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
 
-        if hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
+        if "optuna_trials" in self.to_save and hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
             self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
 
-        # Guardar modelo
-        if hasattr(pipeline, "model") and pipeline.model is not None:
+        if "model" in self.to_save and hasattr(pipeline, "model") and pipeline.model is not None:
             self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
 
-        # Guardar total_error si existe
-        if total_error is not None:
+        if "total_error" in self.to_save and total_error is not None:
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
 
-        # Guardar DataFrame final
-        #if hasattr(pipeline, "df") and pipeline.df is not None:
-        #    self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df)
-
-        # Guardar log si existe
-        if hasattr(pipeline, "log_filename"):
+        if "log" in self.to_save and hasattr(pipeline, "log_filename"):
             log_local_path = pipeline.log_filename
             if log_local_path and os.path.exists(log_local_path):
                 log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
                 os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
                 shutil.copy2(log_local_path, log_dest_path)
 
-        # Guardar mejores parámetros si están definidos
-        if hasattr(pipeline, "best_params") and hasattr(pipeline, "best_num_boost_rounds"):
+        if "best_params" in self.to_save and hasattr(pipeline, "best_params") and hasattr(pipeline, "best_num_boost_rounds"):
             best_config = {
                 "best_params": pipeline.best_params,
                 "best_num_boost_rounds": pipeline.best_num_boost_rounds
             }
             self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
-
+            
+        if "df" in self.to_save and hasattr(pipeline, "df") and pipeline.df is not None:
+            self._save_pickle_local(exp_prefix + "df.pkl", pipeline.df) #cambiar nombre
+            
+        if "scaler" in self.to_save and hasattr(pipeline, "scaler") and pipeline.scaler is not None:
+            self._save_dataframe_local(exp_prefix + "scaler.csv", pipeline.scaler)
+            
 class CustomScalerStep(PipelineStep):
     """
     Calcula el std por serie (product_id, customer_id) usando solo datos
@@ -2074,7 +2082,7 @@ pipeline = Pipeline(
         SplitDataFrameStep(),
         PrepareXYStep(),
         OptunaLGBMOptimizationStep(n_trials=1, study_name=experiment_name),
-        SaveResults(exp_name=experiment_name),
+        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log"]),
     ],
     experiment_name=experiment_name,
     )

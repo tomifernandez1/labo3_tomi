@@ -27,6 +27,7 @@ import logging
 import shutil
 import traceback
 from optuna.exceptions import TrialPruned
+import json
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
 
@@ -309,6 +310,18 @@ class LoadDataFrameStep(PipelineStep):
         df = pd.read_parquet(self.path, engine="pyarrow")
         df = df.drop(columns=["periodo"])
         pipeline.df = df
+        
+class LoadScalerStep(PipelineStep):
+    """
+    Step que carga un CSV y lo asigna al atributo pipeline.scaler.
+    """
+    def __init__(self, path: str, name: Optional[str] = None):
+        super().__init__(name)
+        self.path = path
+
+    def execute(self, pipeline: Pipeline) -> None:
+        scaler_df = pd.read_csv(self.path)
+        pipeline.scaler = scaler_df
         
 class LoadDataFrameFromPickleStep(PipelineStep):
     """
@@ -1815,6 +1828,57 @@ class KaggleSubmissionStep(PipelineStep):
         # Solo guardar en memoria, NO como artifact
         pipeline.submission = submission
         
+class KaggleSubmissionDelta(PipelineStep):
+    def execute(self, pipeline: Pipeline) -> None:
+        # Obtener modelo directamente de la memoria
+        try:
+            model = pipeline.model
+        except AttributeError:
+            model = pipeline.get_artifact("model")
+
+        # Obtener DataFrames directamente de la memoria
+        kaggle_pred = pipeline.kaggle_pred.copy()  # <-- copio para no modificar original
+        X_kaggle = pipeline.X_kaggle.copy()
+
+        # Intentar obtener scaler
+        try:
+            scaler = pipeline.get_artifact("scaler")
+        except ValueError:
+            scaler = None
+            pipeline.logger.warning("Scaler not found. Proceeding without scaling X_kaggle.")
+
+        try:
+            scaler_target = pipeline.get_artifact("scaler_target")
+        except ValueError:
+            scaler_target = None
+            pipeline.logger.warning("Scaler target not found. Proceeding without inverse transform.")
+
+        # Escalar si corresponde
+        if scaler:
+            X_kaggle[scaler.feature_names_in_] = scaler.transform(X_kaggle[scaler.feature_names_in_])
+        else:
+            pipeline.logger.info("Skipping input scaling for X_kaggle.")
+
+        # Predicción (delta)
+        delta_preds = model.predict(X_kaggle)
+
+        # Desescalar si corresponde
+        if scaler_target:
+            delta_preds = scaler_target.inverse_transform(delta_preds.reshape(-1, 1)).flatten()
+        else:
+            pipeline.logger.info("Skipping inverse transform for predictions.")
+
+        # Ahora sumo delta_preds al valor tn actual para obtener tn_predicha
+        # Asumo que en kaggle_pred está la columna "tn" que representa tn (último mes)
+        kaggle_pred["tn_predicha"] = kaggle_pred["tn"] - delta_preds
+
+        # Hago la agregación para submission final (ajusta según tu lógica)
+        submission = kaggle_pred.groupby("product_id")["tn_predicha"].sum().reset_index()
+        submission.columns = ["product_id", "tn"]
+
+        # Guardar en memoria (NO como artifact)
+        pipeline.submission = submission
+        
 class KaggleSubmissionStepSubset(PipelineStep):
     """
     Kaggle submission step robusto para subsets: asegura que kaggle_pred y X_kaggle tengan el mismo índice y longitud.
@@ -1916,17 +1980,119 @@ class SaveSubsetExperimentStep(PipelineStep):
             with open(os.path.join(subset_dir, "model.pkl"), "wb") as f:
                 pickle.dump(model, f)
                 
+class CustomScalerStep(PipelineStep):
+    """
+    Calcula el std por serie (product_id, customer_id) usando solo datos
+    hasta el periodo máximo definido (fecha <= max_period).
+    Usa fallback al std por producto si std_cust_prod es bajo.
+    Guarda en pipeline.scaler un DataFrame con ['product_id', 'customer_id', 'std_final'].
+    
+    Args:
+        min_std_threshold (float): umbral para considerar std suficientemente alto.
+        max_period (str or pd.Timestamp): fecha límite para filtrar datos (inclusive).
+            Ejemplo: '2019-08'
+    """
+    def __init__(self, min_std_threshold: float = 0.001,
+                 max_period: str = '2019-08',
+                 name: Optional[str] = None):
+        super().__init__(name)
+        self.min_std_threshold = min_std_threshold
+        self.max_period = max_period
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        # Verificar tipo de dato de 'fecha' y convertir a datetime solo si es necesario
+        if isinstance(df['fecha'].dtype, pd.PeriodDtype):
+            fecha_ts = df['fecha'].dt.to_timestamp()
+        else:
+            fecha_ts = pd.to_datetime(df['fecha'], format="%Y-%m")
+
+        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
+
+        # Filtrar solo datos hasta max_period (inclusive)
+        df_filtered = df[fecha_ts <= max_period_dt]
+
+        # Calcular std por (product_id, customer_id) con datos filtrados
+        std_cust_prod = df_filtered.groupby(['product_id', 'customer_id'])['tn'].std().reset_index()
+        std_cust_prod.rename(columns={'tn': 'std_cust_prod'}, inplace=True)
+
+        # Calcular std por product_id con datos filtrados
+        std_prod = df_filtered.groupby('product_id')['tn'].std().reset_index()
+        std_prod.rename(columns={'tn': 'std_prod'}, inplace=True)
+
+        # Merge
+        scaler_df = std_cust_prod.merge(std_prod, on='product_id', how='left')
+
+        # Crear std_final
+        mask = (scaler_df['std_cust_prod'].isna()) | (scaler_df['std_cust_prod'] < self.min_std_threshold)
+        scaler_df['std_final'] = scaler_df['std_cust_prod']
+        scaler_df.loc[mask, 'std_final'] = scaler_df.loc[mask, 'std_prod']
+        scaler_df['std_final'] = scaler_df['std_final'].fillna(1.0)
+
+        # Guardar solo columnas necesarias
+        pipeline.scaler = scaler_df[['product_id', 'customer_id', 'std_final']]
+  
+class ScaleTnDerivedFeaturesStep(PipelineStep):
+    """
+    Escala columnas derivadas de 'tn' (lags, rolling stats y diferencias absolutas relacionadas a tn)
+    usando el std_final guardado en pipeline.scaler para cada (product_id, customer_id).
+    Crea nuevas columnas con sufijo '_scaled' sin modificar las originales.
+    """
+    def __init__(self, name: Optional[str] = None, base_feature_prefix='tn'):
+        super().__init__(name)
+        self.base_feature_prefix = base_feature_prefix  # Ejemplo: 'tn'
+
+    def execute(self, pipeline: Pipeline) -> None:
+        df = pipeline.df
+
+        if not hasattr(pipeline, "scaler"):
+            raise ValueError("pipeline.scaler no está definido. Ejecutá CustomScalerStep primero.")
+
+        scaler_df = pipeline.scaler
+
+        # Merge para agregar std_final a cada fila según product_id y customer_id
+        df = df.merge(scaler_df, on=['product_id', 'customer_id'], how='left')
+
+        # Columnas a escalar: lags, rolling, y diferencias que se basen en la feature base (ej. 'tn')
+        cols_to_scale = []
+        for col in df.columns:
+            if (
+                (col.startswith(f"{self.base_feature_prefix}_lag_") or
+                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
+                 (f"{self.base_feature_prefix}_diff_" in col))
+            ):
+                cols_to_scale.append(col)
+
+        for col in cols_to_scale:
+            df[f"{col}_scaled"] = df[col] / df['std_final']
+
+        # Eliminar columna temporal
+        df.drop(columns=['std_final'], inplace=True)
+
+        pipeline.df = df
+                
 class SaveResults(PipelineStep):
     """
     Guarda los resultados relevantes de cada experimento directamente en la carpeta local
     donde está montado el bucket de GCS (sin usar autenticación ni API de GCS).
+    Permite parametrizar qué artefactos guardar basándose en atributos directos del pipeline.
     """
-    # Ruta fija donde está montado el bucket de GCS
     BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
 
-    def __init__(self, exp_name: str, name: Optional[str] = None):
+    def __init__(self, exp_name: str, to_save=None, name: Optional[str] = None):
+        """
+        to_save: lista o set con strings que indiquen qué guardar. 
+                 Opciones: "submission", "feature_importance", "optuna_trials", "total_error",
+                           "model", "log", "best_params"
+                 Si es None, guarda todo.
+        """
         super().__init__(name)
         self.exp_name = exp_name
+        self.to_save = set(to_save) if to_save is not None else {
+            "submission", "feature_importance", "optuna_trials", "total_error",
+            "model", "log", "best_params","scaler"
+        }
 
     def _save_string_local(self, relative_path, content: str):
         full_path = os.path.join(self.BASE_BUCKET_PATH, relative_path)
@@ -1947,53 +2113,44 @@ class SaveResults(PipelineStep):
             with open(full_path, "wb") as f:
                 pickle.dump(obj, f)
 
-    def execute(self, pipeline: Pipeline) -> None:
-        # Obtener datos directamente de la memoria del pipeline
-        total_error = pipeline.total_error
-        exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
-
-        # Guardar submission desde memoria
-        try:
-            submission = pipeline.submission
-        except AttributeError:
-            submission = pipeline.get_artifact("submission")
-        self._save_dataframe_local(exp_prefix + "submission.csv", submission)
-
-        # Guardar feature importance desde memoria
-        try:
-            feature_importance_df = pipeline.feature_importance_df
-        except AttributeError:
-            feature_importance_df = pipeline.get_artifact("feature_importance_df")
-        self._save_dataframe_local(exp_prefix + "feature_importance.csv", feature_importance_df)
-
-        # Guardar optuna trials desde memoria
-        try:
-            optuna_trials_df = pipeline.optuna_trials_df
-        except AttributeError:
-            optuna_trials_df = pipeline.get_artifact("optuna_trials_df")
-        self._save_dataframe_local(exp_prefix + "optuna_trials.csv", optuna_trials_df)
-
-        # Guardar total error y otros datos
+    def execute(self, pipeline) -> None:
+        total_error = getattr(pipeline, "total_error", None)
         if total_error is not None:
+            exp_prefix = f"experiments/{self.exp_name}_error_test_{total_error:.4f}/"
+        else:
+            exp_prefix = f"experiments/{self.exp_name}/"
+
+        if "submission" in self.to_save and hasattr(pipeline, "submission") and pipeline.submission is not None:
+            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
+
+        if "feature_importance" in self.to_save and hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
+            self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
+
+        if "optuna_trials" in self.to_save and hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
+            self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
+
+        if "model" in self.to_save and hasattr(pipeline, "model") and pipeline.model is not None:
+            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+
+        if "total_error" in self.to_save and total_error is not None:
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
 
-        # Guardar modelo desde memoria
-        try:
-            model = pipeline.model
-        except AttributeError:
-            model = pipeline.get_artifact("model")
-        self._save_pickle_local(exp_prefix + "model.pkl", model)
+        if "log" in self.to_save and hasattr(pipeline, "log_filename"):
+            log_local_path = pipeline.log_filename
+            if log_local_path and os.path.exists(log_local_path):
+                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+                os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
+                shutil.copy2(log_local_path, log_dest_path)
 
-        # Guardar dataframe principal
-        #self._save_pickle_local(exp_prefix + "df_procesamiento_2.pkl", pipeline.df)
-        
-        # Copiar log file
-        log_local_path = pipeline.log_filename
-        if os.path.exists(log_local_path):
-            log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
-            os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
-            import shutil
-            shutil.copy2(log_local_path, log_dest_path)            
+        if "best_params" in self.to_save and hasattr(pipeline, "best_params") and hasattr(pipeline, "best_num_boost_rounds"):
+            best_config = {
+                "best_params": pipeline.best_params,
+                "best_num_boost_rounds": pipeline.best_num_boost_rounds
+            }
+            self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
+            
+        if "scaler" in self.to_save and hasattr(pipeline, "scaler") and pipeline.scaler is not None:
+            self._save_dataframe_local(exp_prefix + "scaler.csv", pipeline.scaler)
                     
 #### ---- Pipeline Execution ---- ####
 experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
@@ -2006,7 +2163,7 @@ pipeline = Pipeline(
                 "periodos_desde_ultima_compra": "float32",
             }
         ),
-        CustomScalerStep(),
+        LoadScalerStep(),
         ScaleTnDerivedFeaturesStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
@@ -2014,8 +2171,8 @@ pipeline = Pipeline(
         TrainFinalModelLGBKaggleStep(),
         SaveFeatureImportanceStep(),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
-        KaggleSubmissionStep(),
-        SaveResults()
+        KaggleSubmissionDelta(),
+        SaveResults(exp_name=experiment_name,to_save=["submission","model","feature_importance","log"])
     ],
     experiment_name=experiment_name,
     )
