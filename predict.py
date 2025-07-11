@@ -2165,7 +2165,8 @@ pipeline = Pipeline(
             }
         ),
         LoadScalerStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/scaler.csv"),
-        ScaleTnDerivedFeaturesStep(),        
+        ScaleTnDerivedFeaturesStep(),
+        ReduceMemoryUsageStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
         LoadBestOptunaParamsStep(exp_name=experiment_name, base_path=base_path),
