@@ -1697,16 +1697,16 @@ class LoadBestOptunaParamsStep(PipelineStep):
     y los deja disponibles en el pipeline como `pipeline.best_params` y `pipeline.best_num_boost_rounds`.
     """
     
-    BASE_BUCKET_PATH = "/home/tomifernandezlabo3/gcs-bucket"
-
-    def __init__(self, exp_name: str, name: Optional[str] = None):
+    def __init__(self, exp_name: str, base_path: Optional[str] = None, name: Optional[str] = None):
         super().__init__(name)
         self.exp_name = exp_name
+        # Si no se proporciona base_path, se usa la ruta por defecto
+        self.base_path = base_path if base_path else "/home/tomifernandezlabo3/gcs-bucket"
 
     def execute(self, pipeline: Pipeline) -> None:
         # Buscar carpeta del experimento
         exp_prefix = f"experiments/{self.exp_name}/"
-        json_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix, "best_params.json")
+        json_path = os.path.join(self.base_path, exp_prefix, "best_params.json")
 
         if not os.path.exists(json_path):
             raise FileNotFoundError(f"No se encontró el archivo de parámetros: {json_path}")
@@ -2153,10 +2153,10 @@ class SaveResults(PipelineStep):
             self._save_dataframe_local(exp_prefix + "scaler.csv", pipeline.scaler)
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_20250710_1610" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/df_fe.pkl"), ## Cambiar por el path correcto del pickle
         CastDataTypesStep(dtypes=
             {
                 "edad_customer_producto": "float32", 

@@ -2068,7 +2068,7 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
 experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250708_0105/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/df_fe.pkl"), ## Cambiar por el path correcto del pickle
         CustomScalerStep(),
         ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),        
@@ -2081,7 +2081,7 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=1, study_name=experiment_name),
+        OptunaLGBMOptimizationStep(n_trials=10, study_name=experiment_name),
         SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log"]),
     ],
     experiment_name=experiment_name,
