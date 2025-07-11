@@ -2164,7 +2164,7 @@ pipeline = Pipeline(
                 "periodos_desde_ultima_compra": "float32",
             }
         ),
-        LoadScalerStep(),
+        LoadScalerStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/scaler.csv"),
         ScaleTnDerivedFeaturesStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
