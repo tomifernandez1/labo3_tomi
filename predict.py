@@ -2154,6 +2154,7 @@ class SaveResults(PipelineStep):
                     
 #### ---- Pipeline Execution ---- ####
 experiment_name = "exp_lgbm_target_delta_20250710_1610" #Nombre del experimento para guardar resultados
+base_path = "/home/tomifernandezlabo3/gcs-bucket"
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/df_fe.pkl"), ## Cambiar por el path correcto del pickle
@@ -2167,7 +2168,7 @@ pipeline = Pipeline(
         ScaleTnDerivedFeaturesStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadBestOptunaParamsStep(exp_name=experiment_name),
+        LoadBestOptunaParamsStep(exp_name=experiment_name, base_path=base_path),
         TrainFinalModelLGBKaggleStep(),
         SaveFeatureImportanceStep(),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
