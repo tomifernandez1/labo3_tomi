@@ -348,6 +348,30 @@ class LoadDataFrameFromPickleStep(PipelineStep):
         pipeline.df = df
         print(f"DataFrame cargado desde: {self.path} (shape: {df.shape})")
         
+class LoadLGBMModelFromPickleStep(PipelineStep):
+    """
+    Carga un modelo de LightGBM desde un archivo .pkl y lo guarda en pipeline.model.
+
+    Args:
+        path (str): Ruta al archivo pickle del modelo.
+    """
+    def __init__(self, path: str, name: Optional[str] = None):
+        super().__init__(name)
+        self.path = path
+
+    def execute(self, pipeline: Pipeline) -> None:
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(f"No se encontró el archivo de modelo: {self.path}")
+        
+        with open(self.path, "rb") as f:
+            model = pickle.load(f)
+
+        if not isinstance(model, lgb.Booster):
+            raise TypeError(f"El objeto cargado no es un modelo de LightGBM (lgb.Booster), sino: {type(model)}")
+
+        pipeline.model = model
+        print(f"Modelo LightGBM cargado desde: {self.path}")
+        
 class WeightedSubsampleSeriesStep(PipelineStep):
     """
     Submuestrea series (customer_id, product_id) ponderando por el promedio de tn.
@@ -1218,17 +1242,17 @@ class SplitDataFrameStep(PipelineStep):
         last_train_date = sorted_dated[-4] #
         
         kaggle_pred = df[df["fecha"] == last_date]
-        test = df[df["fecha"] == last_test_date]
-        eval_data = df[df["fecha"] == last_train_date]
-        train = df[(df["fecha"] < last_train_date)]
-        df_final = df[df["fecha"] <= last_test_date] # Incluye Octubre para Kaggle
-        df_intermedio = df[df["fecha"] <= last_train_date] # Incluye Septiembre para testear Octubre
-        pipeline.train = train
-        pipeline.eval_data = eval_data
-        pipeline.test = test
+        #test = df[df["fecha"] == last_test_date]
+        #eval_data = df[df["fecha"] == last_train_date]
+        #train = df[(df["fecha"] < last_train_date)]
+        #df_final = df[df["fecha"] <= last_test_date] # Incluye Octubre para Kaggle
+        #df_intermedio = df[df["fecha"] <= last_train_date] # Incluye Septiembre para testear Octubre
+        #pipeline.train = train
+        #pipeline.eval_data = eval_data
+        #pipeline.test = test
         pipeline.kaggle_pred = kaggle_pred
-        pipeline.df_intermedio = df_intermedio
-        pipeline.df_final = df_final
+        #pipeline.df_intermedio = df_intermedio
+        #pipeline.df_final = df_final
 
 
 class CustomMetric:
@@ -1261,17 +1285,18 @@ class PrepareXYStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        train = pipeline.train
-        eval_data = pipeline.eval_data
-        test = pipeline.test
+        #train = pipeline.train
+        #eval_data = pipeline.eval_data
+        #test = pipeline.test
         kaggle_pred = pipeline.kaggle_pred
-        df_intermedio = pipeline.df_intermedio
-        df_final = pipeline.df_final
+        #df_intermedio = pipeline.df_intermedio
+        #df_final = pipeline.df_final
 
-        features = [col for col in train.columns if col not in
+        features = [col for col in kaggle_pred.columns if col not in
                         ['fecha', 'target']]
         target = 'target'
 
+        """
         X_train = pd.concat([train[features], eval_data[features]]) # [train + eval] + [eval] -> [test] 
         y_train = pd.concat([train[target], eval_data[target]])
 
@@ -1282,15 +1307,17 @@ class PrepareXYStep(PipelineStep):
         y_eval = eval_data[target]
 
         X_test = test[features]
-        y_test = test[['product_id', 'target']]
+        y_test = test[['product_id', 'target']]"""
 
-        X_train_final = df_final[features]
-        y_train_final = df_final[target]
+        #X_train_final = df_final[features]
+        #y_train_final = df_final[target]
         X_kaggle = kaggle_pred[features]
         
+        """
         X_train_intermedio = df_intermedio[features]
-        y_train_intermedio = df_intermedio[target]
-                
+        y_train_intermedio = df_intermedio[target]"""
+        
+        """        
         pipeline.X_train = X_train
         pipeline.y_train = y_train
         pipeline.X_train_alone = X_train_alone
@@ -1301,8 +1328,9 @@ class PrepareXYStep(PipelineStep):
         pipeline.y_test = y_test
         pipeline.X_train_intermedio = X_train_intermedio
         pipeline.y_train_intermedio = y_train_intermedio
-        pipeline.X_train_final = X_train_final
-        pipeline.y_train_final = y_train_final
+        """
+        #pipeline.X_train_final = X_train_final
+        #pipeline.y_train_final = y_train_final
         pipeline.X_kaggle = X_kaggle
         
 
@@ -2058,9 +2086,10 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
         cols_to_scale = []
         for col in df.columns:
             if (
-                (col.startswith(f"{self.base_feature_prefix}_lag_") or
-                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
-                 (f"{self.base_feature_prefix}_diff_" in col))
+                col == self.base_feature_prefix or
+                col.startswith(f"{self.base_feature_prefix}_lag_") or
+                col.startswith(f"{self.base_feature_prefix}_rolling_") or
+                (f"{self.base_feature_prefix}_diff_" in col)
             ):
                 cols_to_scale.append(col)
 
@@ -2169,12 +2198,10 @@ pipeline = Pipeline(
         ReduceMemoryUsageStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadBestOptunaParamsStep(exp_name=experiment_name, base_path=base_path),
-        TrainFinalModelLGBKaggleStep(),
-        SaveFeatureImportanceStep(),
+        LoadLGBMModelFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/model.pkl"),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
         KaggleSubmissionDelta(),
-        SaveResults(exp_name=experiment_name,to_save=["submission","model","feature_importance","log"])
+        SaveResults(exp_name=experiment_name,to_save=["submission","log"])
     ],
     experiment_name=experiment_name,
     )

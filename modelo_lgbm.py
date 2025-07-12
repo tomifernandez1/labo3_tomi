@@ -2048,9 +2048,10 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
         cols_to_scale = []
         for col in df.columns:
             if (
-                (col.startswith(f"{self.base_feature_prefix}_lag_") or
-                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
-                 (f"{self.base_feature_prefix}_diff_" in col))
+                col == self.base_feature_prefix or
+                col.startswith(f"{self.base_feature_prefix}_lag_") or
+                col.startswith(f"{self.base_feature_prefix}_rolling_") or
+                (f"{self.base_feature_prefix}_diff_" in col)
             ):
                 cols_to_scale.append(col)
 
@@ -2081,8 +2082,9 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=10, study_name=experiment_name),
-        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log"]),
+        OptunaLGBMOptimizationStep(n_trials=10, study_name="optuna_version_2"),
+        TrainFinalModelLGBKaggleStep(),
+        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log","model"]),
     ],
     experiment_name=experiment_name,
     )
