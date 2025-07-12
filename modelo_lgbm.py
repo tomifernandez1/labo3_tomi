@@ -2073,7 +2073,7 @@ pipeline = Pipeline(
         CustomScalerStep(),
         ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),        
-        WeightedSubsampleSeriesStep(),
+        WeightedSubsampleSeriesStep(sample_fraction=0.35),
         CastDataTypesStep(dtypes=
             {
                 "edad_customer_producto": "float32", 
