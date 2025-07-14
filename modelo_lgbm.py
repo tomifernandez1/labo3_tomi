@@ -2132,7 +2132,7 @@ pipeline = Pipeline(
         SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log","model","feature_importance"]),
     ],
     experiment_name=experiment_name,
-    ),
+    )
 
 try:
     pipeline.run(verbose=True)
