@@ -1239,20 +1239,20 @@ class SplitDataFrameStep(PipelineStep):
         sorted_dated = sorted(df["fecha"].unique())
         last_date = sorted_dated[-1] # es 12-2019
         last_test_date = sorted_dated[-3] # needs a gap because forecast moth+2
-        last_train_date = sorted_dated[-4] #
+        #last_train_date = sorted_dated[-4] #
         
         kaggle_pred = df[df["fecha"] == last_date]
         #test = df[df["fecha"] == last_test_date]
         #eval_data = df[df["fecha"] == last_train_date]
         #train = df[(df["fecha"] < last_train_date)]
-        #df_final = df[df["fecha"] <= last_test_date] # Incluye Octubre para Kaggle
+        df_final = df[df["fecha"] <= last_test_date] # Incluye Octubre para Kaggle
         #df_intermedio = df[df["fecha"] <= last_train_date] # Incluye Septiembre para testear Octubre
         #pipeline.train = train
         #pipeline.eval_data = eval_data
         #pipeline.test = test
         pipeline.kaggle_pred = kaggle_pred
         #pipeline.df_intermedio = df_intermedio
-        #pipeline.df_final = df_final
+        pipeline.df_final = df_final
 
 
 class CustomMetric:
@@ -1290,7 +1290,7 @@ class PrepareXYStep(PipelineStep):
         #test = pipeline.test
         kaggle_pred = pipeline.kaggle_pred
         #df_intermedio = pipeline.df_intermedio
-        #df_final = pipeline.df_final
+        df_final = pipeline.df_final
 
         features = [col for col in kaggle_pred.columns if col not in
                         ['fecha', 'target']]
@@ -1309,8 +1309,8 @@ class PrepareXYStep(PipelineStep):
         X_test = test[features]
         y_test = test[['product_id', 'target']]"""
 
-        #X_train_final = df_final[features]
-        #y_train_final = df_final[target]
+        X_train_final = df_final[features]
+        y_train_final = df_final[target]
         X_kaggle = kaggle_pred[features]
         
         """
@@ -1329,8 +1329,8 @@ class PrepareXYStep(PipelineStep):
         pipeline.X_train_intermedio = X_train_intermedio
         pipeline.y_train_intermedio = y_train_intermedio
         """
-        #pipeline.X_train_final = X_train_final
-        #pipeline.y_train_final = y_train_final
+        pipeline.X_train_final = X_train_final
+        pipeline.y_train_final = y_train_final
         pipeline.X_kaggle = X_kaggle
         
 
@@ -2150,7 +2150,7 @@ class SaveResults(PipelineStep):
             exp_prefix = f"experiments/{self.exp_name}/"
 
         if "submission" in self.to_save and hasattr(pipeline, "submission") and pipeline.submission is not None:
-            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
+            self._save_dataframe_local(exp_prefix + "submission_v2.csv", pipeline.submission)
 
         if "feature_importance" in self.to_save and hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
             self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
@@ -2159,7 +2159,7 @@ class SaveResults(PipelineStep):
             self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
 
         if "model" in self.to_save and hasattr(pipeline, "model") and pipeline.model is not None:
-            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+            self._save_pickle_local(exp_prefix + "model_v2.pkl", pipeline.model)
 
         if "total_error" in self.to_save and total_error is not None:
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
@@ -2167,7 +2167,7 @@ class SaveResults(PipelineStep):
         if "log" in self.to_save and hasattr(pipeline, "log_filename"):
             log_local_path = pipeline.log_filename
             if log_local_path and os.path.exists(log_local_path):
-                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log.txt")
+                log_dest_path = os.path.join(self.BASE_BUCKET_PATH, exp_prefix + "pipeline_log_v3.txt")
                 os.makedirs(os.path.dirname(log_dest_path), exist_ok=True)
                 shutil.copy2(log_local_path, log_dest_path)
 
@@ -2182,7 +2182,7 @@ class SaveResults(PipelineStep):
             self._save_dataframe_local(exp_prefix + "scaler.csv", pipeline.scaler)
                     
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_train_pesos" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_20250710_1610" #Nombre del experimento para guardar resultados
 base_path = "/home/tomifernandezlabo3/gcs-bucket"
 pipeline = Pipeline(
     steps=[
@@ -2193,12 +2193,13 @@ pipeline = Pipeline(
                 "periodos_desde_ultima_compra": "float32",
             }
         ),
-        LoadScalerStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/scaler.csv"),
+        LoadScalerStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/scaler.csv"),
         ScaleTnDerivedFeaturesStep(),
-        ReduceMemoryUsageStep(),        
+        ReduceMemoryUsageStep(),   
+        LoadBestOptunaParamsStep(exp_name=experiment_name, base_path=base_path),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadLGBMModelFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/model.pkl"),
+        TrainFinalModelLGBKaggleStep(),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
         KaggleSubmissionDelta(),
         SaveResults(exp_name=experiment_name,to_save=["submission","log"])
@@ -2228,4 +2229,4 @@ finally:
 
     except Exception as log_upload_error:
         print("Error copying log to mounted bucket path:", log_upload_error)
-        traceback.print_exc()
+        traceback.print_exc()x

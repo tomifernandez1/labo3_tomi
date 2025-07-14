@@ -1399,7 +1399,7 @@ class OptunaLGBMOptimizationStep(PipelineStep):
 
         def objective(trial):
             try:
-                train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features)
+                train_data = lgb.Dataset(X_train, label=y_train, weight=pipeline.sample_weights, categorical_feature=cat_features)
                 eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
                 callbacks = [lgb.early_stopping(250)]
                 param = {
@@ -1667,7 +1667,7 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         cat_features = [col for col in X_train_final.columns if X_train_final[col].dtype.name == 'category']
 
         # Dataset final
-        train_data = lgb.Dataset(X_train_final, label=y_train_final, categorical_feature=cat_features)
+        train_data = lgb.Dataset(X_train_final, label=y_train_final, weight=pipeline.sample_weights, categorical_feature=cat_features)
 
         # Entrenamiento del modelo final
         model = lgb.train(
@@ -2062,18 +2062,62 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
         df.drop(columns=['std_final'], inplace=True)
 
         pipeline.df = df
-                        
-                 
-                    
+        
+class PrecomputeSeriesWeightsStep(PipelineStep):
+    """
+    Calcula el promedio de tn por (customer_id, product_id) y lo guarda
+    como diccionario directamente en el pipeline (no como artefacto).
+    """
+
+    def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
+        super().__init__(name)
+        self.tn_col = tn_col
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        df = pipeline.df
+
+        # Calcular promedio tn por serie
+        avg_tn = df.groupby(["customer_id", "product_id"])[self.tn_col].mean()
+
+        # Guardar como diccionario en memoria
+        pipeline.weight_dict = avg_tn.to_dict()
+
+class AssignPrecomputedWeightsStep(PipelineStep):
+    """
+    Asigna los pesos precomputados desde pipeline.weight_dict al df actual.
+    Guarda el vector resultante en pipeline.sample_weights.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__(name)
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        df = pipeline.df
+
+        # Usar el diccionario en memoria
+        weight_dict = pipeline.weight_dict
+
+        # Mapear pesos por fila
+        weights = df.apply(
+            lambda row: weight_dict.get((row["customer_id"], row["product_id"]), 1.0),
+            axis=1
+        )
+
+        # Guardar en memoria
+        pipeline.sample_weights = weights.values
+
+                                      
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_20250708_0105" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_train_pesos" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/df_fe.pkl"), ## Cambiar por el path correcto del pickle
         CustomScalerStep(),
         ScaleTnDerivedFeaturesStep(),
-        ReduceMemoryUsageStep(),        
-        WeightedSubsampleSeriesStep(sample_fraction=0.35),
+        ReduceMemoryUsageStep(),  
+        PrecomputeSeriesWeightsStep(tn_col="tn"),    
+        WeightedSubsampleSeriesStep(sample_fraction=0.50),
+        AssignPrecomputedWeightsStep(),
         CastDataTypesStep(dtypes=
             {
                 "edad_customer_producto": "float32", 
@@ -2082,12 +2126,13 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=10, study_name="optuna_version_2"),
+        OptunaLGBMOptimizationStep(n_trials=10, study_name="optuna_version_1"),
         TrainFinalModelLGBKaggleStep(),
-        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log","model"]),
+        SaveFeatureImportanceStep(),
+        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log","model","feature_importance"]),
     ],
     experiment_name=experiment_name,
-    )
+    ),
 
 try:
     pipeline.run(verbose=True)
