@@ -1217,7 +1217,28 @@ class SplitDataFrameStep(PipelineStep):
         pipeline.kaggle_pred = kaggle_pred
         pipeline.df_intermedio = df_intermedio
         pipeline.df_final = df_final
+        
+        if hasattr(pipeline, "sample_weights"):
+            full_weights = pipeline.sample_weights
 
+            # train + eval para Optuna
+            idx_train_eval = train.index.union(eval_data.index)
+            weights_train = full_weights.reindex(idx_train_eval).fillna(1.0)
+            pipeline.sample_weights_train = weights_train
+
+            # df_final para entrenamiento final
+            weights_final = full_weights.reindex(df_final.index).fillna(1.0)
+            pipeline.sample_weights_train_final = weights_final
+
+            # Logging de alineación
+            pipeline.logger.info(f"[SplitDataFrameStep] sample_weights_train: {len(weights_train)} obs, expected {len(idx_train_eval)}")
+            pipeline.logger.info(f"[SplitDataFrameStep] sample_weights_train_final: {len(weights_final)} obs, expected {len(df_final)}")
+
+            # Check adicional de desalineación
+            if weights_train.isnull().any():
+                pipeline.logger.warning("[SplitDataFrameStep] sample_weights_train tiene valores nulos tras reindex.")
+            if weights_final.isnull().any():
+                pipeline.logger.warning("[SplitDataFrameStep] sample_weights_train_final tiene valores nulos tras reindex.")
 
 class CustomMetric:
     def __init__(self, df_eval, product_id_col='product_id', scaler=None):
@@ -1390,16 +1411,16 @@ class OptunaLGBMOptimizationStep(PipelineStep):
         df_eval = pipeline.eval_data
      
         if scaler_target is not None:
-            custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
+            custom_metric = CustomMetricDelta(df_eval, product_id_col='product_id', scaler=scaler_target)
         else:
             pipeline.logger.warning("CustomMetric created without scaler_target.")
-            custom_metric = CustomMetric(df_eval, product_id_col='product_id')        
+            custom_metric = CustomMetricDelta(df_eval, product_id_col='product_id')        
             
         cat_features = [col for col in X_train.columns if X_train[col].dtype.name == 'category']
 
         def objective(trial):
             try:
-                train_data = lgb.Dataset(X_train, label=y_train, weight=pipeline.sample_weights, categorical_feature=cat_features)
+                train_data = lgb.Dataset(X_train, label=y_train, weight=pipeline.sample_weights_train, categorical_feature=cat_features)
                 eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
                 callbacks = [lgb.early_stopping(250)]
                 param = {
@@ -1667,7 +1688,7 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         cat_features = [col for col in X_train_final.columns if X_train_final[col].dtype.name == 'category']
 
         # Dataset final
-        train_data = lgb.Dataset(X_train_final, label=y_train_final, weight=pipeline.sample_weights, categorical_feature=cat_features)
+        train_data = lgb.Dataset(X_train_final, label=y_train_final, weight=pipeline.sample_weights_train_final, categorical_feature=cat_features)
 
         # Entrenamiento del modelo final
         model = lgb.train(
@@ -2104,19 +2125,76 @@ class AssignPrecomputedWeightsStep(PipelineStep):
         )
 
         # Guardar en memoria
-        pipeline.sample_weights = weights.values
+        weights = pd.Series(weights.values, index=df.index)
+        pipeline.sample_weights = weights
+        
+class CustomMetricDelta:
+    def __init__(self, df_eval, product_id_col='product_id', scaler=None):
+        self.scaler = scaler
+        self.df_eval = df_eval
+        self.product_id_col = product_id_col
+
+    def __call__(self, preds, train_data):
+        import numpy as np
+
+        labels = train_data.get_label()
+        df_temp = self.df_eval.copy()
+        df_temp['delta_preds'] = preds
+        df_temp['delta_labels'] = labels
+
+        if self.scaler:
+            df_temp['delta_preds'] = self.scaler.inverse_transform(df_temp[['delta_preds']])
+            df_temp['delta_labels'] = self.scaler.inverse_transform(df_temp[['delta_labels']])
+
+        # Verificamos que exista 'tn' (último tn conocido)
+        if 'tn' not in df_temp.columns:
+            raise ValueError("df_eval debe tener la columna 'tn' con el último valor de tn conocido")
+
+        # Invertir para obtener tn predicha y tn real a partir de delta
+        df_temp['preds'] = df_temp['tn'] - df_temp['delta_preds']
+        df_temp['labels'] = df_temp['tn'] - df_temp['delta_labels']
+
+        # Agrupar por producto y sumar tn reales y predichos
+        por_producto = df_temp.groupby(self.product_id_col).agg({'labels': 'sum', 'preds': 'sum'})
+
+        # Calcular error relativo absoluto (igual que antes)
+        denominador = por_producto['labels'].abs()
+        denominador[denominador < 1e-6] = 1e-6  # para evitar división por cero
+        error = np.sum(np.abs(por_producto['labels'] - por_producto['preds'])) / np.sum(denominador)
+
+        return 'custom_error', error, False
+    
+class LoadBestParamsStep(PipelineStep):
+    """
+    Carga el archivo best_params.json y asigna:
+    - pipeline.best_params
+    - pipeline.best_num_boost_rounds
+    """
+    def __init__(self, path: str, name: Optional[str] = None):
+        super().__init__(name)
+        self.path = path
+
+    def execute(self, pipeline: Pipeline) -> None:
+        try:
+            with open(self.path, "r") as f:
+                best_config = json.load(f)
+
+            pipeline.best_params = best_config["best_params"]
+            pipeline.best_num_boost_rounds = best_config["best_num_boost_rounds"]
+            
+            pipeline.logger.info(f"Loaded best_params and best_num_boost_rounds from {self.path}")
+        except Exception as e:
+            pipeline.logger.error(f"Failed to load best_params from {self.path}: {e}")
+            raise
+
 
                                       
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_train_pesos" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_target_delta_train_pesos_1672025" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/experiments/exp_lgbm_target_delta_20250710_1610/df_fe.pkl"), ## Cambiar por el path correcto del pickle
-        CustomScalerStep(),
-        ScaleTnDerivedFeaturesStep(),
-        ReduceMemoryUsageStep(),  
+        LoadDataFrameFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/df_subsampleado.pkl"), ## Cambiar por el path correcto del pickle
         PrecomputeSeriesWeightsStep(tn_col="tn"),    
-        WeightedSubsampleSeriesStep(sample_fraction=0.50),
         AssignPrecomputedWeightsStep(),
         CastDataTypesStep(dtypes=
             {
@@ -2126,10 +2204,26 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=10, study_name="optuna_version_1"),
+        LoadBestParamsStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/best_params.json"), 
+        #en caso de no terminar la bayesiana, poner a mano los mejores parametros de los trials que llegaron a hacerse.
+        #pipeline.best_params = {"num_leaves": 128, 
+        #                        "learning_rate": 0.03, 
+         #                       "max_depth": 7, 
+          #                      "objective": "regression", 
+           #                     "boosting_type": "gbdt", 
+            #                    "feature_fraction": 0.8, 
+             #                   "bagging_fraction": 0.8, 
+              #                  "bagging_freq": 5, 
+               #                 "min_child_samples": 20, 
+                #                "verbose": -1, 
+                 #               "max_bin": 255, 
+                  #              "lambda_l1": 0.1, 
+                   #             "lambda_l2": 0.1, 
+                    #            "n_jobs": -1}
+        #pipeline.best_num_boost_rounds = 1000
         TrainFinalModelLGBKaggleStep(),
         SaveFeatureImportanceStep(),
-        SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log","model","feature_importance"]),
+        SaveResults(exp_name=experiment_name,to_save=["log","model","feature_importance"]),
     ],
     experiment_name=experiment_name,
     )
