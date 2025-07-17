@@ -1384,7 +1384,7 @@ class TrainModelLGBStep(PipelineStep):
         pipeline.model = model
         
 class OptunaLGBMOptimizationStep(PipelineStep):
-    def __init__(self, n_trials=50,study_name="optuna_lgbm", db_path="optuna_study.db", name: Optional[str] = None):
+    def __init__(self, n_trials=50,study_name="optuna_lgbm", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db", name: Optional[str] = None):
         super().__init__(name)
         self.n_trials = n_trials
         self.study_name = study_name
@@ -2188,12 +2188,13 @@ class CustomMetricDelta:
 experiment_name = "exp_lgbm_target_delta_train_pesos_1672025" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/datasets/df_fe.pkl"), ## Cambiar por el path correcto del pickle
-        CustomScalerStep(),
-        ScaleTnDerivedFeaturesStep(),
-        ReduceMemoryUsageStep(),  
-        WeightedSubsampleSeriesStep(sample_fraction=0.30),
-        SaveResults(exp_name=experiment_name, to_save=["df"]), #guardar df subsampleado
+        #LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/datasets/df_fe.pkl"), ## Cambiar por el path correcto del pickle
+        #CustomScalerStep(),
+        #ScaleTnDerivedFeaturesStep(),
+        #ReduceMemoryUsageStep(),  
+        #WeightedSubsampleSeriesStep(sample_fraction=0.30),
+        #SaveResults(exp_name=experiment_name, to_save=["df"]), #guardar df subsampleado
+        LoadDataFrameFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/df_subsampleado.pkl"),
         PrecomputeSeriesWeightsStep(tn_col="tn"),    
         AssignPrecomputedWeightsStep(),
         CastDataTypesStep(dtypes=
@@ -2204,7 +2205,7 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=100, study_name="exp_lgbm_target_delta_train_pesos_1672025"),
+        OptunaLGBMOptimizationStep(n_trials=100, study_name="exp_lgbm_target_delta_train_pesos_1672025", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db"),
         SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log"]),
     ],
     experiment_name=experiment_name,
