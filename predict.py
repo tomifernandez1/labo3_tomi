@@ -2150,7 +2150,7 @@ class SaveResults(PipelineStep):
             exp_prefix = f"experiments/{self.exp_name}/"
 
         if "submission" in self.to_save and hasattr(pipeline, "submission") and pipeline.submission is not None:
-            self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
+            self._save_dataframe_local(exp_prefix + "submission_trial2.csv", pipeline.submission)
 
         if "feature_importance" in self.to_save and hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
             self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
@@ -2193,12 +2193,13 @@ pipeline = Pipeline(
                 "periodos_desde_ultima_compra": "float32",
             }
         ),
-        LoadScalerStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/scaler.csv"),
+        #LoadScalerStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/scaler.csv"),
+        CustomScalerStep(),
         ScaleTnDerivedFeaturesStep(),
         ReduceMemoryUsageStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadLGBMModelFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/model.pkl"),
+        LoadLGBMModelFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/model_trial2.pkl"),
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
         KaggleSubmissionDelta(),
         SaveResults(exp_name=experiment_name,to_save=["submission","log"])

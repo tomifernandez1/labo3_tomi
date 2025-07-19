@@ -1688,7 +1688,10 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         cat_features = [col for col in X_train_final.columns if X_train_final[col].dtype.name == 'category']
 
         # Dataset final
-        train_data = lgb.Dataset(X_train_final, label=y_train_final, weight=pipeline.sample_weights_train_final, categorical_feature=cat_features)
+        train_data = lgb.Dataset(X_train_final, 
+                                 label=y_train_final, 
+                                 #weight=pipeline.sample_weights_train_final, 
+                                 categorical_feature=cat_features)
 
         # Entrenamiento del modelo final
         model = lgb.train(
@@ -1960,13 +1963,13 @@ class SaveResults(PipelineStep):
             self._save_dataframe_local(exp_prefix + "submission.csv", pipeline.submission)
 
         if "feature_importance" in self.to_save and hasattr(pipeline, "feature_importance_df") and pipeline.feature_importance_df is not None:
-            self._save_dataframe_local(exp_prefix + "feature_importance.csv", pipeline.feature_importance_df)
+            self._save_dataframe_local(exp_prefix + "feature_importance_trial2.csv", pipeline.feature_importance_df)
 
         if "optuna_trials" in self.to_save and hasattr(pipeline, "optuna_trials_df") and pipeline.optuna_trials_df is not None:
             self._save_dataframe_local(exp_prefix + "optuna_trials.csv", pipeline.optuna_trials_df)
 
         if "model" in self.to_save and hasattr(pipeline, "model") and pipeline.model is not None:
-            self._save_pickle_local(exp_prefix + "model.pkl", pipeline.model)
+            self._save_pickle_local(exp_prefix + "model_trial2.pkl", pipeline.model)
 
         if "total_error" in self.to_save and total_error is not None:
             self._save_string_local(exp_prefix + "total_error.txt", str(total_error))
@@ -1983,7 +1986,7 @@ class SaveResults(PipelineStep):
                 "best_params": pipeline.best_params,
                 "best_num_boost_rounds": pipeline.best_num_boost_rounds
             }
-            self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
+            self._save_string_local(exp_prefix + "best_params_trail2.json", json.dumps(best_config, indent=4))
             
         if "df" in self.to_save and hasattr(pipeline, "df") and pipeline.df is not None:
             self._save_pickle_local(exp_prefix + "df.pkl", pipeline.df) #cambiar nombre
@@ -2186,16 +2189,45 @@ class LoadBestParamsStep(PipelineStep):
         except Exception as e:
             pipeline.logger.error(f"Failed to load best_params from {self.path}: {e}")
             raise
+        
+class ManualSetBestParamsStep(PipelineStep):
+    """
+    Permite setear manualmente los mejores parámetros e inyectarlos al pipeline.
+    """
+
+    def __init__(self, best_params: dict, best_num_boost_rounds: int, name: Optional[str] = None):
+        super().__init__(name)
+        self._best_params = best_params
+        self._best_num_boost_rounds = best_num_boost_rounds
+
+    def execute(self, pipeline: Pipeline) -> None:
+        pipeline.best_params = self._best_params
+        pipeline.best_num_boost_rounds = self._best_num_boost_rounds
+        print("Parámetros manuales cargados en el pipeline.")
 
 
                                       
 #### ---- Pipeline Execution ---- ####
 experiment_name = "exp_lgbm_target_delta_train_pesos_1672025" #Nombre del experimento para guardar resultados
+manual_params = {"num_leaves": 1537, 
+                                "learning_rate": 0.032091773, 
+                                "max_depth": 20, 
+                                "objective": "regression", 
+                                "boosting_type": "gbdt", 
+                                "feature_fraction": 0.875335609, 
+                                "bagging_fraction": 0.847479033, 
+                                "bagging_freq": 52, 
+                                "min_child_samples": 18, 
+                                "verbose": -1, 
+                                "max_bin": 391, 
+                                "lambda_l1": 0.003254999, 
+                                "lambda_l2": 0.043096966, 
+                                "n_jobs": -1}
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/df_subsampleado.pkl"), ## Cambiar por el path correcto del pickle
-        PrecomputeSeriesWeightsStep(tn_col="tn"),    
-        AssignPrecomputedWeightsStep(),
+        #PrecomputeSeriesWeightsStep(tn_col="tn"),    
+        #AssignPrecomputedWeightsStep(),
         CastDataTypesStep(dtypes=
             {
                 "edad_customer_producto": "float32", 
@@ -2204,23 +2236,9 @@ pipeline = Pipeline(
         ),
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadBestParamsStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/best_params.json"), 
+        #LoadBestParamsStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/best_params.json"), 
         #en caso de no terminar la bayesiana, poner a mano los mejores parametros de los trials que llegaron a hacerse.
-        #pipeline.best_params = {"num_leaves": 128, 
-        #                        "learning_rate": 0.03, 
-         #                       "max_depth": 7, 
-          #                      "objective": "regression", 
-           #                     "boosting_type": "gbdt", 
-            #                    "feature_fraction": 0.8, 
-             #                   "bagging_fraction": 0.8, 
-              #                  "bagging_freq": 5, 
-               #                 "min_child_samples": 20, 
-                #                "verbose": -1, 
-                 #               "max_bin": 255, 
-                  #              "lambda_l1": 0.1, 
-                   #             "lambda_l2": 0.1, 
-                    #            "n_jobs": -1}
-        #pipeline.best_num_boost_rounds = 1000
+        ManualSetBestParamsStep(best_params=manual_params, best_num_boost_rounds=1321),
         TrainFinalModelLGBKaggleStep(),
         SaveFeatureImportanceStep(),
         SaveResults(exp_name=experiment_name,to_save=["log","model","feature_importance"]),
