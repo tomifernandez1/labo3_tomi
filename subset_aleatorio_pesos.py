@@ -26,6 +26,7 @@ import multiprocessing
 import logging
 import shutil
 import traceback
+from optuna.exceptions import TrialPruned
 import json
 
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented*")
@@ -86,7 +87,7 @@ class Pipeline:
         """Initialize the pipeline."""
         self.steps: List[PipelineStep] = steps if steps is not None else []
         self.artifacts: Dict[str, Any] = {}
-        self.df: Optional[pd.DataFrame] = None
+        self.df: Optional[pd.DataFrame] = None        
         self.use_gcs = use_gcs
         self.bucket_name = bucket_name or self.DEFAULT_BUCKET_NAME
         self.storage_client = storage.Client() if self.use_gcs else None      
@@ -272,7 +273,7 @@ class Pipeline:
 class ReduceMemoryUsageStep(PipelineStep):
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
-        
+                   
     def execute(self, pipeline: Pipeline) -> None:
         df = pipeline.df
         initial_mem_usage = df.memory_usage().sum() / 1024**2
@@ -313,6 +314,7 @@ class LoadDataFrameStep(PipelineStep):
 class LoadDataFrameFromPickleStep(PipelineStep):
     """
     Carga un DataFrame desde un archivo .pkl y lo guarda en pipeline.df.
+    Si encuentra una columna que contenga 'target' en el nombre, la renombra a 'target'.
     """
     def __init__(self, path: str, name: Optional[str] = None):
         super().__init__(name)
@@ -323,8 +325,58 @@ class LoadDataFrameFromPickleStep(PipelineStep):
             raise FileNotFoundError(f"No se encontró el archivo: {self.path}")
         
         df = pd.read_pickle(self.path)
+
+        # Renombrar columnas que contengan 'target' en el nombre a 'target'
+        target_cols = [col for col in df.columns if 'target' in col.lower()]
+        if target_cols:
+            # Solo mantener la primera que se encuentra
+            print(f"Renombrando columna '{target_cols[0]}' a 'target'")
+            df.rename(columns={target_cols[0]: 'target'}, inplace=True)
+
         pipeline.df = df
         print(f"DataFrame cargado desde: {self.path} (shape: {df.shape})")
+        
+class WeightedSubsampleSeriesStep(PipelineStep):
+    """
+    Submuestrea series (customer_id, product_id) ponderando por el promedio de tn.
+    Se priorizan combinaciones con mayor promedio en la selección aleatoria."""
+    
+    def __init__(
+        self,
+        tn_col: str = "tn",
+        sample_fraction: float = 0.25,
+        random_state: int = 42,
+        name: Optional[str] = None
+    ):
+        super().__init__(name)
+        self.tn_col = tn_col
+        self.sample_fraction = sample_fraction
+        self.random_state = random_state
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        df = pipeline.df
+        # 1. calculo agregado x serie
+        series_avg_tn = (
+            df.groupby(["customer_id", "product_id"])[self.tn_col]
+            .sum()
+            .reset_index(name="sum_tn")
+        )
+        # 2. Normalizar pesos
+        series_avg_tn["sampling_weight"] = series_avg_tn["sum_tn"]
+        # 3. Muestrear series con probabilidad proporcional al promedio
+        sampled_series = series_avg_tn.sample(
+            frac=self.sample_fraction,
+            weights="sampling_weight",
+            random_state=self.random_state
+        )
+        # 4. Filtrar dataset original
+        df_filtered = df.merge(
+            sampled_series[["customer_id", "product_id"]],
+            on=["customer_id", "product_id"],
+            how="inner")
+        
+        pipeline.df = df_filtered
+        
 
 class SplitCustomerProductByGroupStep(PipelineStep):
     """
@@ -348,48 +400,6 @@ class SplitCustomerProductByGroupStep(PipelineStep):
             df_subsets[f"subset_{i+1}"] = merged
         pipeline.df_subsets = df_subsets
         print(f"Dividido en {self.n_splits} subsets y guardado en pipeline.df_subsets.")
-        
-class WeightedSubsampleSeriesStep(PipelineStep):
-    """
-    Submuestrea series (customer_id, product_id) ponderando por el promedio de tn.
-    Se priorizan combinaciones con mayor promedio en la selección aleatoria."""
-    
-    def __init__(
-        self,
-        tn_col: str = "tn",
-        sample_fraction: float = 0.25,
-        random_state: int = 42,
-        name: Optional[str] = None
-    ):
-        super().__init__(name)
-        self.tn_col = tn_col
-        self.sample_fraction = sample_fraction
-        self.random_state = random_state
-
-    def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.df
-        # 1. Calcular promedio de tn por serie
-        series_avg_tn = (
-            df.groupby(["customer_id", "product_id"])[self.tn_col]
-            .mean()
-            .reset_index(name="avg_tn")
-        )
-        # 2. Normalizar pesos
-        series_avg_tn["sampling_weight"] = series_avg_tn["avg_tn"] #/ series_avg_tn["avg_tn"].sum()
-        # 3. Muestrear series con probabilidad proporcional al promedio
-        sampled_series = series_avg_tn.sample(
-            frac=self.sample_fraction,
-            weights="sampling_weight",
-            random_state=self.random_state
-        )
-        # 4. Filtrar dataset original
-        df_filtered = df.merge(
-            sampled_series[["customer_id", "product_id"]],
-            on=["customer_id", "product_id"],
-            how="inner")
-        
-        pipeline.df = df_filtered
-
 
 class CastDataTypesStep(PipelineStep):
     def __init__(self, dtypes: Dict[str, str], name: Optional[str] = None):
@@ -891,105 +901,6 @@ class FeatureEngineeringProductCatInteractionStep(PipelineStep):
         df = df.merge(df_cat, on="fecha", how="left")
         pipeline.df = df
         
-class CustomScalerStep(PipelineStep):
-    """
-    Calcula el std por serie (product_id, customer_id) usando solo datos
-    hasta el periodo máximo definido (fecha <= max_period).
-    Usa fallback al std por producto si std_cust_prod es bajo.
-    Guarda en pipeline.scaler un DataFrame con ['product_id', 'customer_id', 'std_final'].
-
-    Args:
-        min_std_threshold (float): umbral para considerar std suficientemente alto.
-        max_period (str or pd.Timestamp): fecha límite para filtrar datos (inclusive).
-            Ejemplo: '2019-08'
-    """
-    def __init__(self, min_std_threshold: float = 0.001,
-                 max_period: str = '2019-08',
-                 name: Optional[str] = None):
-        super().__init__(name)
-        self.min_std_threshold = min_std_threshold
-        self.max_period = max_period
-
-    def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.df.copy()
-
-        # Convertir max_period a datetime
-        max_period_dt = pd.to_datetime(self.max_period, format="%Y-%m")
-
-        # Convertir 'fecha' a datetime solo para el filtro, sin modificar la original
-        if pd.api.types.is_period_dtype(df['fecha']):
-            fecha_ts = df['fecha'].dt.to_timestamp()
-        else:
-            fecha_ts = pd.to_datetime(df['fecha'])
-
-        # Filtrar hasta la fecha límite
-        df_filtered = df[fecha_ts <= max_period_dt]
-
-        # Calcular std por (product_id, customer_id)
-        std_cust_prod = (
-            df_filtered.groupby(['product_id', 'customer_id'])['tn']
-            .std()
-            .reset_index()
-            .rename(columns={'tn': 'std_cust_prod'})
-        )
-
-        # Calcular std por product_id
-        std_prod = (
-            df_filtered.groupby('product_id')['tn']
-            .std()
-            .reset_index()
-            .rename(columns={'tn': 'std_prod'})
-        )
-
-        # Merge y cálculo de std_final
-        scaler_df = std_cust_prod.merge(std_prod, on='product_id', how='left')
-        mask = (scaler_df['std_cust_prod'].isna()) | (scaler_df['std_cust_prod'] < self.min_std_threshold)
-        scaler_df['std_final'] = scaler_df['std_cust_prod']
-        scaler_df.loc[mask, 'std_final'] = scaler_df.loc[mask, 'std_prod']
-        scaler_df['std_final'] = scaler_df['std_final'].fillna(1.0)
-
-        # Guardar en pipeline
-        pipeline.scaler = scaler_df[['product_id', 'customer_id', 'std_final']]
-        
-class ScaleTnDerivedFeaturesStep(PipelineStep):
-    """
-    Escala columnas derivadas de 'tn' (lags, rolling stats y diferencias absolutas relacionadas a tn)
-    usando el std_final guardado en pipeline.scaler para cada (product_id, customer_id).
-    Crea nuevas columnas con sufijo '_scaled' sin modificar las originales.
-    """
-    def __init__(self, name: Optional[str] = None, base_feature_prefix='tn'):
-        super().__init__(name)
-        self.base_feature_prefix = base_feature_prefix  # Ejemplo: 'tn'
-
-    def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.df
-
-        if not hasattr(pipeline, "scaler"):
-            raise ValueError("pipeline.scaler no está definido. Ejecutá CustomScalerStep primero.")
-
-        scaler_df = pipeline.scaler
-
-        # Merge para agregar std_final a cada fila según product_id y customer_id
-        df = df.merge(scaler_df, on=['product_id', 'customer_id'], how='left')
-
-        # Columnas a escalar: lags, rolling, y diferencias que se basen en la feature base (ej. 'tn')
-        cols_to_scale = []
-        for col in df.columns:
-            if (
-                (col.startswith(f"{self.base_feature_prefix}_lag_") or
-                 col.startswith(f"{self.base_feature_prefix}_rolling_") or
-                 (f"{self.base_feature_prefix}_diff_" in col))
-            ):
-                cols_to_scale.append(col)
-
-        for col in cols_to_scale:
-            df[f"{col}_scaled"] = df[col] / df['std_final']
-
-        # Eliminar columna temporal
-        df.drop(columns=['std_final'], inplace=True)
-
-        pipeline.df = df
-                
 class OutlierPasoFeatureStep(PipelineStep):
     def __init__(self, fecha_outlier: str = "2019-08-01", name: Optional[str] = None):
         super().__init__(name)
@@ -1283,54 +1194,6 @@ class EdadCustomerProductoStep(PipelineStep):
 
         pipeline.df = df
         
-import multiprocessing
-
-class CountZeroPeriodsInWindowStep(PipelineStep):
-    """
-    Cuenta cuántos períodos en una ventana deslizante tienen tn == 0, por grupo (customer_id, product_id),
-    paralelizado por combinación columna × ventana.
-    """
-    def __init__(self, tn_columns: List[str], windows: List[int], name: Optional[str] = None, n_jobs: int = -1):
-        super().__init__(name)
-        self.tn_columns = tn_columns
-        self.windows = windows
-        self.n_jobs = n_jobs
-
-    def _count_zeros(self, values):
-        return (values == 0).sum()
-
-    def _compute_zero_count(self, args):
-        col, window, df_small = args
-        grouped = df_small.groupby(['product_id', 'customer_id'])
-        return (
-            f"{col}_zeros_last_{window}",
-            grouped[col].transform(lambda x: x.rolling(window, min_periods=1).apply(self._count_zeros, raw=True))
-        )
-
-    def execute(self, pipeline: Pipeline) -> None:
-        df = pipeline.df
-        df = df.sort_values(by=["product_id", "customer_id", "fecha"])
-
-        # Preparar tareas: combinaciones de columnas × ventanas
-        tasks = []
-        for col in self.tn_columns:
-            for window in self.windows:
-                df_small = df[["product_id", "customer_id", "fecha", col]].copy()
-                tasks.append((col, window, df_small))
-
-        # Paralelizar
-        if self.n_jobs == -1:
-            self.n_jobs = multiprocessing.cpu_count()
-
-        with multiprocessing.Pool(processes=self.n_jobs) as pool:
-            results = pool.map(self._compute_zero_count, tasks)
-
-        # Agregar resultados al df
-        for col_name, series in results:
-            df[col_name] = series
-
-        pipeline.df = df
-        
 class SplitDataFrameStep(PipelineStep):
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
@@ -1354,7 +1217,28 @@ class SplitDataFrameStep(PipelineStep):
         pipeline.kaggle_pred = kaggle_pred
         pipeline.df_intermedio = df_intermedio
         pipeline.df_final = df_final
+        
+        if hasattr(pipeline, "sample_weights"):
+            full_weights = pipeline.sample_weights
 
+            # train + eval para Optuna
+            idx_train_eval = train.index.union(eval_data.index)
+            weights_train = full_weights.reindex(idx_train_eval).fillna(1.0)
+            pipeline.sample_weights_train = weights_train
+
+            # df_final para entrenamiento final
+            weights_final = full_weights.reindex(df_final.index).fillna(1.0)
+            pipeline.sample_weights_train_final = weights_final
+
+            # Logging de alineación
+            pipeline.logger.info(f"[SplitDataFrameStep] sample_weights_train: {len(weights_train)} obs, expected {len(idx_train_eval)}")
+            pipeline.logger.info(f"[SplitDataFrameStep] sample_weights_train_final: {len(weights_final)} obs, expected {len(df_final)}")
+
+            # Check adicional de desalineación
+            if weights_train.isnull().any():
+                pipeline.logger.warning("[SplitDataFrameStep] sample_weights_train tiene valores nulos tras reindex.")
+            if weights_final.isnull().any():
+                pipeline.logger.warning("[SplitDataFrameStep] sample_weights_train_final tiene valores nulos tras reindex.")
 
 class CustomMetric:
     def __init__(self, df_eval, product_id_col='product_id', scaler=None):
@@ -1458,11 +1342,11 @@ class TrainModelLGBStep(PipelineStep):
         self.num_boost_round = num_boost_round
 
     def execute(self, pipeline: Pipeline) -> None:
-        X_train = pipeline.get_artifact(self.train_eval_sets["X_train"])
-        y_train = pipeline.get_artifact(self.train_eval_sets["y_train"])
-        X_eval = pipeline.get_artifact(self.train_eval_sets["X_eval"])
-        y_eval = pipeline.get_artifact(self.train_eval_sets["y_eval"])
-        df_eval = pipeline.get_artifact(self.train_eval_sets["eval_data"])
+        X_train = pipeline.X_train
+        y_train = pipeline.y_train
+        X_eval = pipeline.X_eval
+        y_eval = pipeline.y_eval
+        df_eval = pipeline.eval_data
 
         cat_features = [col for col in X_train.columns if X_train[col].dtype.name == 'category']
 
@@ -1485,7 +1369,7 @@ class TrainModelLGBStep(PipelineStep):
         eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
         custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
         callbacks = [
-            lgb.early_stopping(200),
+            lgb.early_stopping(250),
             lgb.log_evaluation(100),
         ]
         model = lgb.train(
@@ -1497,15 +1381,25 @@ class TrainModelLGBStep(PipelineStep):
             callbacks=callbacks
         )
         # Save the model
-        self.save_artifact(pipeline, "model", model)
+        pipeline.model = model
         
 class OptunaLGBMOptimizationStep(PipelineStep):
-    def __init__(self, n_trials=50, name: Optional[str] = None):
+    def __init__(self, n_trials=50,study_name="optuna_lgbm", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db", name: Optional[str] = None):
         super().__init__(name)
         self.n_trials = n_trials
+        self.study_name = study_name
+        self.db_path = db_path  # Ruta local al .db        
 
     def execute(self, pipeline: Pipeline) -> None:
         
+        # Ruta incremental al bucket
+        self.results_path = os.path.join(
+            "/home/tomifernandezlabo3/gcs-bucket",
+            "experiments",
+            pipeline.experiment_name,
+            "optuna_trials_incremental.csv"
+        )
+                
         try:
             scaler = pipeline.get_artifact("scaler")
         except ValueError:
@@ -1518,69 +1412,92 @@ class OptunaLGBMOptimizationStep(PipelineStep):
             scaler_target = None
             pipeline.logger.warning("Scaler target not found. Proceeding without target scaling.")
                 
-        X_train = pipeline.get_artifact("X_train")
-        y_train = pipeline.get_artifact("y_train")
-        X_eval = pipeline.get_artifact("X_eval")
-        y_eval = pipeline.get_artifact("y_eval")
-        df_eval = pipeline.get_artifact("eval_data")
+        X_train = pipeline.X_train
+        y_train = pipeline.y_train
+        X_eval = pipeline.X_eval
+        y_eval = pipeline.y_eval
+        df_eval = pipeline.eval_data
      
         if scaler_target is not None:
-            custom_metric = CustomMetric(df_eval, product_id_col='product_id', scaler=scaler_target)
+            custom_metric = CustomMetricDelta(df_eval, product_id_col='product_id', scaler=scaler_target)
         else:
             pipeline.logger.warning("CustomMetric created without scaler_target.")
-            custom_metric = CustomMetric(df_eval, product_id_col='product_id')        
+            custom_metric = CustomMetricDelta(df_eval, product_id_col='product_id')        
             
         cat_features = [col for col in X_train.columns if X_train[col].dtype.name == 'category']
 
         def objective(trial):
-            train_data = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_features)
-            eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
-            callbacks = [lgb.early_stopping(200)]
-            param = {
-                'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
-                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'random_state': 42,
-                'boosting_type': 'gbdt',
-                'objective': 'tweedie',
-                'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
-                'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.9),
-                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.9),
-                'bagging_freq': trial.suggest_int('bagging_freq', 1, 100),
-                'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
-                'verbose': -1,
-                'max_bin': trial.suggest_int('max_bin', 255, 1000),
-                'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
-                'lambda_l2': trial.suggest_float('lambda_l2', 1e-4, 10.0, log=True),
-                'n_jobs': -1,
-            }
-            num_boost_rounds = trial.suggest_int('num_boost_rounds', 500, 2000)
+            try:
+                train_data = lgb.Dataset(X_train, label=y_train, weight=pipeline.sample_weights_train, categorical_feature=cat_features)
+                eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
+                callbacks = [lgb.early_stopping(150)]
+                param = {
+                    'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
+                    'max_depth': trial.suggest_int('max_depth', 3, 20),
+                    'random_state': 42,
+                    'boosting_type': 'gbdt',
+                    'objective': 'regression',
+                    #'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
+                    'feature_fraction': trial.suggest_float('feature_fraction', 0.8, 0.9),
+                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.8, 0.9),
+                    'bagging_freq': trial.suggest_int('bagging_freq', 50, 200),
+                    'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
+                    'verbose': -1,
+                    'max_bin': trial.suggest_int('max_bin', 255, 1000),
+                    'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
+                    'lambda_l2': trial.suggest_float('lambda_l2', 1e-4, 10.0, log=True),
+                    'n_jobs': -1,
+                }
+                num_boost_rounds = trial.suggest_int('num_boost_rounds', 1000, 3000)
 
-            model = lgb.train(
-                param,
-                train_data,
-                num_boost_round=num_boost_rounds,
-                valid_sets=[eval_data],
-                feval=custom_metric,
-                callbacks=callbacks
-            )            
-            preds = model.predict(X_eval)
-            _, score, _ = custom_metric(preds, lgb.Dataset(X_eval, label=y_eval))
+                model = lgb.train(
+                    param,
+                    train_data,
+                    num_boost_round=num_boost_rounds,
+                    valid_sets=[eval_data],
+                    feval=custom_metric,
+                    callbacks=callbacks
+                )            
+                preds = model.predict(X_eval)
+                _, score, _ = custom_metric(preds, lgb.Dataset(X_eval, label=y_eval))
 
-            trial.set_user_attr("score", score)  # Save score in trial object
-            trial.set_user_attr("num_boost_rounds", num_boost_rounds)
-            del model
-            gc.collect()
-            return score
+                trial.set_user_attr("score", score)  # Save score in trial object
+                trial.set_user_attr("num_boost_rounds", num_boost_rounds)
+                
+                # Guardar incrementalmente en CSV
+                row = {
+                    'trial': trial.number,
+                    'score': score,
+                    'num_boost_rounds': num_boost_rounds,
+                    **trial.params
+                }
+                df_trial = pd.DataFrame([row])
+                df_trial.to_csv(self.results_path, mode='a', index=False, header=not os.path.exists(self.results_path))
+                
+                return score
+            
+            except Exception as e:
+                pipeline.logger.warning(f"Trial {trial.number} failed: {e}")
+                raise TrialPruned()  # Ignora el trial pero continua la ejecucion.
         
-        study = optuna.create_study(direction='minimize')
+        # Crear/recuperar el estudio con almacenamiento persistente
+        storage_url = f"sqlite:///{self.db_path}"
+        study = optuna.create_study(
+            direction='minimize',
+            study_name=self.study_name,
+            storage=storage_url,
+            load_if_exists=True
+        )        
+        
+        pipeline.logger.info(f"Starting optimization with {self.n_trials} trials.")
         study.optimize(objective, n_trials=self.n_trials)
+        pipeline.logger.info("Optimization completed.")
         best_trial = study.best_trial
         best_params = best_trial.params.copy()
         best_num_boost_rounds = best_trial.user_attrs.get("num_boost_rounds", 1000)
-
-        self.save_artifact(pipeline, "best_lgbm_params", best_params)
-        self.save_artifact(pipeline, "best_num_boost_rounds", best_num_boost_rounds)
+        pipeline.best_params = best_params
+        pipeline.best_num_boost_rounds = best_num_boost_rounds
 
         # -----------------------------
         # Guardar tabla completa de trials
@@ -1591,13 +1508,11 @@ class OptunaLGBMOptimizationStep(PipelineStep):
                 'trial': trial.number,
                 'score': trial.user_attrs.get("score", None),
                 'num_boost_rounds': trial.user_attrs.get("num_boost_rounds", None),
-                **trial.params
-            }
+                **trial.params}
             trial_rows.append(row)
-
+            
         df_trials = pd.DataFrame(trial_rows).sort_values(by="score")
-        self.save_artifact(pipeline, "optuna_trials_df", df_trials)
-
+        pipeline.optuna_trials_df = df_trials
         
 class PredictStep(PipelineStep):
     def __init__(self, predict_set: str, name: Optional[str] = None):
@@ -1605,7 +1520,16 @@ class PredictStep(PipelineStep):
         self.predict_set = predict_set
 
     def execute(self, pipeline: Pipeline) -> None:
-        X_predict = pipeline.get_artifact(self.predict_set)
+        # Obtener el DataFrame de predicción directamente de la memoria
+        if self.predict_set == "X_test":
+            X_predict = pipeline.X_test
+        elif self.predict_set == "X_kaggle":
+            X_predict = pipeline.X_kaggle
+        elif self.predict_set == "X_train_final":
+            X_predict = pipeline.X_train_final
+        else:
+            # Fallback a get_artifact si no es uno de los DataFrames en memoria
+            X_predict = pipeline.get_artifact(self.predict_set)
 
         # Intentar obtener el scaler
         try:
@@ -1619,8 +1543,13 @@ class PredictStep(PipelineStep):
             cols_to_scale = scaler.feature_names_in_
             X_predict[cols_to_scale] = scaler.transform(X_predict[cols_to_scale])
 
-        # Obtener el modelo
-        model = pipeline.get_artifact("model_testing")  # o "model" para modelo final
+        # Obtener el modelo directamente de la memoria o como artifact
+        try:
+            model = pipeline.model  # Modelo en memoria
+        except AttributeError:
+            # Fallback a get_artifact
+            model = pipeline.get_artifact("model_testing")  # o "model" para modelo final
+
         predictions = model.predict(X_predict)
 
         # Intentar obtener el scaler_target
@@ -1638,8 +1567,8 @@ class PredictStep(PipelineStep):
         predictions = pd.DataFrame(predictions, columns=["predictions"], index=X_predict.index)
         predictions["product_id"] = X_predict["product_id"]
 
-        # Guardar predicciones
-        self.save_artifact(pipeline, "predictions", predictions)
+        # Guardar predicciones en memoria y como artifact
+        pipeline.predictions = predictions
 
 class EvaluatePredictionsSteps(PipelineStep):
     def __init__(self, y_actual_df: str, name: Optional[str] = None):
@@ -1647,8 +1576,20 @@ class EvaluatePredictionsSteps(PipelineStep):
         self.y_actual_df = y_actual_df
 
     def execute(self, pipeline: Pipeline) -> None:
-        predictions = pipeline.get_artifact("predictions")
-        y_actual = pipeline.get_artifact(self.y_actual_df)
+        # Obtener predicciones directamente de la memoria
+        try:
+            predictions = pipeline.predictions
+        except AttributeError:
+            # Fallback a get_artifact
+            predictions = pipeline.get_artifact("predictions")
+
+        # Obtener y_actual usando el mapeo de nombres comunes
+        if self.y_actual_df == "y_test":
+            y_actual = pipeline.y_test
+        else:
+            # Fallback a get_artifact para otros casos
+            y_actual = pipeline.get_artifact(self.y_actual_df)
+
         product_actual = y_actual.groupby("product_id")["target"].sum()
         product_pred = predictions.groupby("product_id")["predictions"].sum()
 
@@ -1663,16 +1604,11 @@ class EvaluatePredictionsSteps(PipelineStep):
         print("\nTop 10 productos con mayor error absoluto:")
         eval_df['error_absoluto'] = np.abs(eval_df['tn_real'] - eval_df['tn_pred'])
         print(eval_df.sort_values('error_absoluto', ascending=False).head(10))
-        self.save_artifact(pipeline, "eval_df", eval_df)
-        self.save_artifact(pipeline, "total_error", total_error)
-
-
-class PlotFeatureImportanceStep(PipelineStep):
-
-    def execute(self, pipeline: Pipeline) -> None:
-        model = pipeline.get_artifact("model")
-        lgb.plot_importance(model)
         
+        # Guardar en memoria y como artifacts
+        pipeline.eval_df = eval_df
+        pipeline.total_error = total_error
+
 class TrainFinalModelLGBTestingStep(PipelineStep):
     """
     Entrena el modelo final LightGBM usando el dataset hasta Septiembre para testear sobre Octubre
@@ -1682,9 +1618,9 @@ class TrainFinalModelLGBTestingStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        # Cargar datos
-        X_train_final = pipeline.get_artifact("X_train_intermedio")
-        y_train_final = pipeline.get_artifact("y_train_intermedio")
+        # Cargar datos directamente de la memoria
+        X_train_final = pipeline.X_train_intermedio
+        y_train_final = pipeline.y_train_intermedio
 
         # Intentar obtener scaler
         try:
@@ -1708,9 +1644,9 @@ class TrainFinalModelLGBTestingStep(PipelineStep):
                 index=y_train_final.index,
             )
 
-        # Cargar hiperparámetros óptimos
-        best_params = pipeline.get_artifact("best_lgbm_params")
-        best_num_boost_rounds = pipeline.get_artifact("best_num_boost_rounds")
+        # Cargar hiperparámetros óptimos directamente de la memoria
+        best_params = pipeline.best_params
+        best_num_boost_rounds = pipeline.best_num_boost_rounds
 
         # Categorías
         cat_features = [col for col in X_train_final.columns if X_train_final[col].dtype.name == 'category']
@@ -1724,9 +1660,9 @@ class TrainFinalModelLGBTestingStep(PipelineStep):
             train_data,
             num_boost_round=best_num_boost_rounds
         )
-        # Guardar modelo
-        self.save_artifact(pipeline, "model_testing", model)
-        
+        # Guardar modelo en memoria y como artifact
+        pipeline.model_testing = model
+
 class TrainFinalModelLGBKaggleStep(PipelineStep):
     """
     Entrena el modelo final LightGBM usando todo el dataset (X_train_final, y_train_final)
@@ -1736,9 +1672,9 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         super().__init__(name)
 
     def execute(self, pipeline: Pipeline) -> None:
-        # Cargar datos
-        X_train_final = pipeline.get_artifact("X_train_final")
-        y_train_final = pipeline.get_artifact("y_train_final")
+        # Cargar datos directamente de la memoria
+        X_train_final = pipeline.X_train_final
+        y_train_final = pipeline.y_train_final
 
         # Intentar obtener scaler
         try:
@@ -1762,15 +1698,15 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
                 index=y_train_final.index,
             )
 
-        # Cargar hiperparámetros óptimos
-        best_params = pipeline.get_artifact("best_lgbm_params")
-        best_num_boost_rounds = pipeline.get_artifact("best_num_boost_rounds")
+        # Cargar hiperparámetros óptimos directamente de la memoria
+        best_params = pipeline.best_params
+        best_num_boost_rounds = pipeline.best_num_boost_rounds
 
         # Categorías
         cat_features = [col for col in X_train_final.columns if X_train_final[col].dtype.name == 'category']
 
         # Dataset final
-        train_data = lgb.Dataset(X_train_final, label=y_train_final, categorical_feature=cat_features)
+        train_data = lgb.Dataset(X_train_final, label=y_train_final, weight=pipeline.sample_weights_train_final, categorical_feature=cat_features)
 
         # Entrenamiento del modelo final
         model = lgb.train(
@@ -1779,12 +1715,18 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
             num_boost_round=best_num_boost_rounds
         )
 
-        # Guardar modelo entrenado
-        self.save_artifact(pipeline, "model", model)
+        # Guardar modelo en memoria
+        pipeline.model = model        
         
 class SaveFeatureImportanceStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
-        model = pipeline.get_artifact("model")
+        # Obtener el modelo directamente de la memoria
+        try:
+            model = pipeline.model
+        except AttributeError:
+            # Fallback a get_artifact
+            model = pipeline.get_artifact("model")
+        
         # Obtener importancia y nombres de features
         importance = model.feature_importance(importance_type='split')
         features = model.feature_name()
@@ -1792,8 +1734,9 @@ class SaveFeatureImportanceStep(PipelineStep):
             "feature": features,
             "importance": importance
         }).sort_values("importance", ascending=False).reset_index(drop=True)
-        # Guardar como artefacto
-        self.save_artifact(pipeline, "feature_importance_df", df_importance)        
+        
+        # Guardar en memoria y como artefacto
+        pipeline.feature_importance_df = df_importance      
         
 class FilterProductsIDStep(PipelineStep):
     def __init__(self, product_file = "/home/tomifernandezlabo3/labo3_tomi/product_id_apredecir201912.txt", dfs=["df"], name: Optional[str] = None):
@@ -1804,20 +1747,47 @@ class FilterProductsIDStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
         """ el txt es un csv que tiene columna product_id separado por tabulaciones """
         converted_dfs = {}
+        product_ids = pd.read_csv(self.file, sep="\t")["product_id"].tolist()
+        
         for df_key in self.dfs:
-            df = pipeline.get_artifact(df_key)
-            product_ids = pd.read_csv(self.file, sep="\t")["product_id"].tolist()
+            # Obtener DataFrame directamente de la memoria
+            if df_key == "X_kaggle":
+                df = pipeline.X_kaggle
+            elif df_key == "kaggle_pred":
+                df = pipeline.kaggle_pred
+            elif df_key == "df":
+                df = pipeline.df
+            else:
+                # Fallback a get_artifact para otros casos
+                df = pipeline.get_artifact(df_key)
+            
+            # Filtrar por product_ids
             df = df[df["product_id"].isin(product_ids)]
             converted_dfs[df_key] = df
             print(f"Filtered DataFrame {df_key} shape: {df.shape}")
-            pipeline.save_artifact(df_key, df)
-        return converted_dfs        
+            
+            # Guardar en memoria y como artifact
+            if df_key == "X_kaggle":
+                pipeline.X_kaggle = df
+            elif df_key == "kaggle_pred":
+                pipeline.kaggle_pred = df
+            elif df_key == "df":
+                pipeline.df = df
+                            
+        return converted_dfs      
 
 class KaggleSubmissionStep(PipelineStep):
     def execute(self, pipeline: Pipeline) -> None:
-        model = pipeline.get_artifact("model")
-        kaggle_pred = pipeline.get_artifact("kaggle_pred")
-        X_kaggle = pipeline.get_artifact("X_kaggle")
+        # Obtener modelo directamente de la memoria
+        try:
+            model = pipeline.model
+        except AttributeError:
+            # Fallback a get_artifact
+            model = pipeline.get_artifact("model")
+
+        # Obtener DataFrames directamente de la memoria
+        kaggle_pred = pipeline.kaggle_pred
+        X_kaggle = pipeline.X_kaggle
 
         # Intentar obtener scaler
         try:
@@ -1852,7 +1822,8 @@ class KaggleSubmissionStep(PipelineStep):
         submission = kaggle_pred.groupby("product_id")["tn_predicha"].sum().reset_index()
         submission.columns = ["product_id", "tn"]
 
-        self.save_artifact(pipeline, "submission", submission)
+        # Solo guardar en memoria, NO como artifact
+        pipeline.submission = submission
         
 class KaggleSubmissionStepSubset(PipelineStep):
     """
@@ -2033,7 +2004,7 @@ class SaveResults(PipelineStep):
             self._save_string_local(exp_prefix + "best_params.json", json.dumps(best_config, indent=4))
             
         if "df" in self.to_save and hasattr(pipeline, "df") and pipeline.df is not None:
-            self._save_pickle_local(exp_prefix + "df_fe.pkl", pipeline.df) #cambiar nombre
+            self._save_pickle_local(exp_prefix + "df_subsampleado.pkl", pipeline.df) #cambiar nombre
             
         if "scaler" in self.to_save and hasattr(pipeline, "scaler") and pipeline.scaler is not None:
             self._save_dataframe_local(exp_prefix + "scaler.csv", pipeline.scaler)
@@ -2130,38 +2101,102 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
         df.drop(columns=['std_final'], inplace=True)
 
         pipeline.df = df
+        
+class PrecomputeSeriesWeightsStep(PipelineStep):
+    """
+    Calcula el promedio de tn por (customer_id, product_id) y lo guarda
+    como diccionario directamente en el pipeline (no como artefacto).
+    """
 
-                                            
+    def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
+        super().__init__(name)
+        self.tn_col = tn_col
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        df = pipeline.df
+
+        # Calcular promedio tn por serie
+        avg_tn = df.groupby(["customer_id", "product_id"])[self.tn_col].mean()
+
+        # Guardar como diccionario en memoria
+        pipeline.weight_dict = avg_tn.to_dict()
+
+class AssignPrecomputedWeightsStep(PipelineStep):
+    """
+    Asigna los pesos precomputados desde pipeline.weight_dict al df actual.
+    Guarda el vector resultante en pipeline.sample_weights.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__(name)
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        df = pipeline.df
+
+        # Usar el diccionario en memoria
+        weight_dict = pipeline.weight_dict
+
+        # Mapear pesos por fila
+        weights = df.apply(
+            lambda row: weight_dict.get((row["customer_id"], row["product_id"]), 1.0),
+            axis=1
+        )
+
+        # Guardar en memoria
+        weights = pd.Series(weights.values, index=df.index)
+        pipeline.sample_weights = weights
+        
+class CustomMetricDelta:
+    def __init__(self, df_eval, product_id_col='product_id', scaler=None):
+        self.scaler = scaler
+        self.df_eval = df_eval
+        self.product_id_col = product_id_col
+
+    def __call__(self, preds, train_data):
+        import numpy as np
+
+        labels = train_data.get_label()
+        df_temp = self.df_eval.copy()
+        df_temp['delta_preds'] = preds
+        df_temp['delta_labels'] = labels
+
+        if self.scaler:
+            df_temp['delta_preds'] = self.scaler.inverse_transform(df_temp[['delta_preds']])
+            df_temp['delta_labels'] = self.scaler.inverse_transform(df_temp[['delta_labels']])
+
+        # Verificamos que exista 'tn' (último tn conocido)
+        if 'tn' not in df_temp.columns:
+            raise ValueError("df_eval debe tener la columna 'tn' con el último valor de tn conocido")
+
+        # Invertir para obtener tn predicha y tn real a partir de delta
+        df_temp['preds'] = df_temp['tn'] - df_temp['delta_preds']
+        df_temp['labels'] = df_temp['tn'] - df_temp['delta_labels']
+
+        # Agrupar por producto y sumar tn reales y predichos
+        por_producto = df_temp.groupby(self.product_id_col).agg({'labels': 'sum', 'preds': 'sum'})
+
+        # Calcular error relativo absoluto (igual que antes)
+        denominador = por_producto['labels'].abs()
+        denominador[denominador < 1e-6] = 1e-6  # para evitar división por cero
+        error = np.sum(np.abs(por_producto['labels'] - por_producto['preds'])) / np.sum(denominador)
+
+        return 'custom_error', error, False
+
+
+                                      
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_20250708_0105" # Nombre del experimento que inicia todo. 
+experiment_name = "exp_lgbm_delta_target" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/datasets/df_procesamiento_1.pkl"), ## Cambiar por el path correcto del pickle
-        DateRelatedFeaturesStep(),
+        LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/datasets/df_fe.pkl"), ## Cambiar por el path correcto del pickle
         CastDataTypesStep(dtypes=
             {
-                "mes": "uint16",
-                "quarter": "uint16",
-                "year": "uint16",
-                "periodo": "uint16",
-            }),
-        CountZeroPeriodsInWindowStep(tn_columns=["tn"], windows=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36],n_jobs=-1),
-        FeatureEngineeringLagStep(lags=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn", "cust_request_qty", "share_tn_product", "share_tn_customer", "share_tn_cat1", "share_tn_cat2", "share_tn_cat3", "share_tn_brand","product_mean_tn_by_customer","product_mean_cust_request_qty_by_customer","customer_mean_tn_by_fecha","customer_mean_cust_request_qty_by_fecha", "customer_id_unique_products_purchased", "product_id_unique_customers"]),
-        RollingMeanFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        RollingMaxFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        RollingMinFeatureStep(window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36], columns=["tn","cust_request_qty"]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["lag"], window=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_mean"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_max"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        DiferenciaRelativaVsReferenciaStep(columns=["tn","cust_request_qty"], ref_types=["rolling_min"], window=[2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36]),
-        CustomScalerStep(),
-        ScaleTnDerivedFeaturesStep(),        
-        ReduceMemoryUsageStep(),
-        SaveResults(exp_name=experiment_name,to_save=["df","log"]),
+                "edad_customer_producto": "float32", 
+                "periodos_desde_ultima_compra": "float32",
+            }
+        ),
+        WeightedSubsampleSeriesStep(sample_fraction=0.25),
+        SaveResults(exp_name=experiment_name, to_save=["df"]), #guarda dataset subsampleado
     ],
     experiment_name=experiment_name,
     )
