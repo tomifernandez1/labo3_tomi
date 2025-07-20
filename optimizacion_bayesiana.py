@@ -1384,6 +1384,7 @@ class TrainModelLGBStep(PipelineStep):
         pipeline.model = model
         
 class OptunaLGBMOptimizationStep(PipelineStep):
+    
     def __init__(self, n_trials=50,study_name="optuna_lgbm", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db", name: Optional[str] = None):
         super().__init__(name)
         self.n_trials = n_trials
@@ -1430,26 +1431,25 @@ class OptunaLGBMOptimizationStep(PipelineStep):
             try:
                 train_data = lgb.Dataset(X_train, label=y_train, weight=pipeline.sample_weights_train, categorical_feature=cat_features)
                 eval_data = lgb.Dataset(X_eval, label=y_eval, reference=train_data, categorical_feature=cat_features)
-                callbacks = [lgb.early_stopping(150)]
+                callbacks = [lgb.early_stopping(200)]
                 param = {
-                    'num_leaves': trial.suggest_int('num_leaves', 100, 2000),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.05),
+                    'num_leaves': trial.suggest_int('num_leaves', 100, 3000),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.03),
                     'max_depth': trial.suggest_int('max_depth', 3, 20),
                     'random_state': 42,
                     'boosting_type': 'gbdt',
                     'objective': 'regression',
-                    #'tweedie_variance_power': trial.suggest_float('tweedie_variance_power', 1.1, 1.9),
                     'feature_fraction': trial.suggest_float('feature_fraction', 0.8, 0.9),
                     'bagging_fraction': trial.suggest_float('bagging_fraction', 0.8, 0.9),
                     'bagging_freq': trial.suggest_int('bagging_freq', 50, 200),
-                    'min_child_samples': trial.suggest_int('min_child_samples', 10, 200),
+                    'min_child_samples': trial.suggest_int('min_child_samples', 10, 150),
                     'verbose': -1,
                     'max_bin': trial.suggest_int('max_bin', 255, 1000),
                     'lambda_l1': trial.suggest_float('lambda_l1', 1e-4, 10.0, log=True),
                     'lambda_l2': trial.suggest_float('lambda_l2', 1e-4, 10.0, log=True),
                     'n_jobs': -1,
                 }
-                num_boost_rounds = trial.suggest_int('num_boost_rounds', 1000, 3000)
+                num_boost_rounds = trial.suggest_int('num_boost_rounds', 1000, 2000)
 
                 model = lgb.train(
                     param,
@@ -2102,10 +2102,11 @@ class ScaleTnDerivedFeaturesStep(PipelineStep):
 
         pipeline.df = df
         
+
 class PrecomputeSeriesWeightsStep(PipelineStep):
     """
-    Calcula el promedio de tn por (customer_id, product_id) y lo guarda
-    como diccionario directamente en el pipeline (no como artefacto).
+    Calcula el promedio de tn por (customer_id, product_id) a partir del dataset de entrenamiento
+    y lo guarda como diccionario directamente en el pipeline.
     """
 
     def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
@@ -2113,7 +2114,10 @@ class PrecomputeSeriesWeightsStep(PipelineStep):
         self.tn_col = tn_col
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.df
+        if not hasattr(pipeline, "train"):
+            raise ValueError("[PrecomputeSeriesWeightsStep] pipeline.train no está definido. Asegúrate de correr el SplitDataFrameStep antes.")
+
+        df = pipeline.train
 
         # Calcular promedio tn por serie
         avg_tn = df.groupby(["customer_id", "product_id"])[self.tn_col].mean()
@@ -2121,30 +2125,33 @@ class PrecomputeSeriesWeightsStep(PipelineStep):
         # Guardar como diccionario en memoria
         pipeline.weight_dict = avg_tn.to_dict()
 
+        pipeline.logger.info(f"[PrecomputeSeriesWeightsStep] Se calcularon {len(pipeline.weight_dict)} pesos.")
+
 class AssignPrecomputedWeightsStep(PipelineStep):
     """
-    Asigna los pesos precomputados desde pipeline.weight_dict al df actual.
-    Guarda el vector resultante en pipeline.sample_weights.
+    Asigna pesos precomputados a los conjuntos de entrenamiento,
+    garantizando que los índices de los sample_weights coincidan con los de los datasets.
     """
 
     def __init__(self, name: Optional[str] = None):
         super().__init__(name)
 
     def execute(self, pipeline: "Pipeline") -> None:
-        df = pipeline.df
-
-        # Usar el diccionario en memoria
         weight_dict = pipeline.weight_dict
 
-        # Mapear pesos por fila
-        weights = df.apply(
-            lambda row: weight_dict.get((row["customer_id"], row["product_id"]), 1.0),
-            axis=1
-        )
+        def assign_weights(df, label: str):
+            weights = df.apply(
+                lambda row: weight_dict.get((row["customer_id"], row["product_id"]), 1.0),
+                axis=1
+            )
+            weights_series = pd.Series(weights.values, index=df.index)
+            assert (weights_series.index == df.index).all(), \
+                f"[AssignPrecomputedWeightsStep] Índices de sample_weights no coinciden en {label}."
+            pipeline.logger.info(f"[AssignPrecomputedWeightsStep] Asignados {len(weights_series)} pesos a {label}.")
+            return weights_series
 
-        # Guardar en memoria
-        weights = pd.Series(weights.values, index=df.index)
-        pipeline.sample_weights = weights
+        if hasattr(pipeline, "train"):
+            pipeline.sample_weights_train = assign_weights(pipeline.train, "train")
         
 class CustomMetricDelta:
     def __init__(self, df_eval, product_id_col='product_id', scaler=None):
@@ -2185,27 +2192,15 @@ class CustomMetricDelta:
 
                                       
 #### ---- Pipeline Execution ---- ####
-experiment_name = "exp_lgbm_target_delta_train_pesos_1672025" #Nombre del experimento para guardar resultados
+experiment_name = "exp_lgbm_delta_target" #Nombre del experimento para guardar resultados
 pipeline = Pipeline(
     steps=[
-        #LoadDataFrameFromPickleStep(path="/home/tomifernandezlabo3/gcs-bucket/datasets/df_fe.pkl"), ## Cambiar por el path correcto del pickle
-        #CustomScalerStep(),
-        #ScaleTnDerivedFeaturesStep(),
-        #ReduceMemoryUsageStep(),  
-        #WeightedSubsampleSeriesStep(sample_fraction=0.30),
-        #SaveResults(exp_name=experiment_name, to_save=["df"]), #guardar df subsampleado
         LoadDataFrameFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/df_subsampleado.pkl"),
+        SplitDataFrameStep(),
         PrecomputeSeriesWeightsStep(tn_col="tn"),    
         AssignPrecomputedWeightsStep(),
-        CastDataTypesStep(dtypes=
-            {
-                "edad_customer_producto": "float32", 
-                "periodos_desde_ultima_compra": "float32",
-            }
-        ),
-        SplitDataFrameStep(),
         PrepareXYStep(),
-        OptunaLGBMOptimizationStep(n_trials=100, study_name="exp_lgbm_target_delta_train_pesos_1672025", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db"),
+        OptunaLGBMOptimizationStep(n_trials=100, study_name="exp_lgbm_delta_target", db_path="/home/tomifernandezlabo3/gcs-bucket/optuna_study.db"),
         SaveResults(exp_name=experiment_name,to_save=["best_params","optuna_trials","scaler","log"]),
     ],
     experiment_name=experiment_name,

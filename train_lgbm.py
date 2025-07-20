@@ -1690,7 +1690,7 @@ class TrainFinalModelLGBKaggleStep(PipelineStep):
         # Dataset final
         train_data = lgb.Dataset(X_train_final, 
                                  label=y_train_final, 
-                                 #weight=pipeline.sample_weights_train_final, 
+                                 weight=pipeline.sample_weights_train_final, 
                                  categorical_feature=cat_features)
 
         # Entrenamiento del modelo final
@@ -2204,6 +2204,48 @@ class ManualSetBestParamsStep(PipelineStep):
         pipeline.best_params = self._best_params
         pipeline.best_num_boost_rounds = self._best_num_boost_rounds
         print("Parámetros manuales cargados en el pipeline.")
+        
+class PrecomputeFinalSeriesWeightsStep(PipelineStep):
+    """
+    Calcula pesos usando df_final (todo el dataset disponible) para el entrenamiento final.
+    """
+
+    def __init__(self, tn_col: str = "tn", name: Optional[str] = None):
+        super().__init__(name)
+        self.tn_col = tn_col
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        if not hasattr(pipeline, "df_final"):
+            raise ValueError("pipeline.df_final no está definido.")
+
+        df = pipeline.df_final
+
+        avg_tn = df.groupby(["customer_id", "product_id"])[self.tn_col].mean()
+        pipeline.weight_dict_final = avg_tn.to_dict()
+        
+class AssignFinalPrecomputedWeightsStep(PipelineStep):
+    """
+    Asigna los pesos finales precomputados a X_train_final.
+    Guarda el resultado como sample_weights_train_final.
+    """
+
+    def __init__(self, name: Optional[str] = None):
+        super().__init__(name)
+
+    def execute(self, pipeline: "Pipeline") -> None:
+        if not hasattr(pipeline, "X_train_final") or not hasattr(pipeline, "df_final"):
+            raise ValueError("X_train_final o df_final no están definidos.")
+
+        df = pipeline.df_final
+        weight_dict = pipeline.weight_dict_final
+
+        weights = df.apply(
+            lambda row: weight_dict.get((row["customer_id"], row["product_id"]), 1.0),
+            axis=1
+        )
+
+        weights = pd.Series(weights.values, index=df.index)
+        pipeline.sample_weights_train_final = weights
 
 
                                       
@@ -2226,15 +2268,9 @@ manual_params = {"num_leaves": 1537,
 pipeline = Pipeline(
     steps=[
         LoadDataFrameFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/df_subsampleado.pkl"), ## Cambiar por el path correcto del pickle
-        #PrecomputeSeriesWeightsStep(tn_col="tn"),    
-        #AssignPrecomputedWeightsStep(),
-        CastDataTypesStep(dtypes=
-            {
-                "edad_customer_producto": "float32", 
-                "periodos_desde_ultima_compra": "float32",
-            }
-        ),
         SplitDataFrameStep(),
+        PrecomputeFinalSeriesWeightsStep(),
+        AssignFinalPrecomputedWeightsStep(),
         PrepareXYStep(),
         #LoadBestParamsStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/best_params.json"), 
         #en caso de no terminar la bayesiana, poner a mano los mejores parametros de los trials que llegaron a hacerse.

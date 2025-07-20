@@ -2193,13 +2193,9 @@ pipeline = Pipeline(
                 "periodos_desde_ultima_compra": "float32",
             }
         ),
-        #LoadScalerStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/scaler.csv"),
-        CustomScalerStep(),
-        ScaleTnDerivedFeaturesStep(),
-        ReduceMemoryUsageStep(),        
         SplitDataFrameStep(),
         PrepareXYStep(),
-        LoadLGBMModelFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/model_trial2.pkl"),
+        LoadLGBMModelFromPickleStep(path=f"/home/tomifernandezlabo3/gcs-bucket/experiments/{experiment_name}/model_trial2.pkl"), #cambiar nombre modelo
         FilterProductsIDStep(dfs=["X_kaggle","kaggle_pred"]),   
         KaggleSubmissionDelta(),
         SaveResults(exp_name=experiment_name,to_save=["submission","log"])
